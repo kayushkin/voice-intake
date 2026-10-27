@@ -1,0 +1,19 @@
+[Unit]
+Description=speech-server: Parakeet transcription and Silero voice activity detection, kept in memory for voice-intake
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/speech-server
+
+# Loopback, deliberately: it serves voice-intake on this host only.
+Environment=SPEECH_SERVER_ADDR=127.0.0.1:8335
+
+# The model files and the library path are host settings. They go in a
+# host-local drop-in beside this unit, never here: see README "Host setup".
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

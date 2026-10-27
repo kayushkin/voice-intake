@@ -23,6 +23,17 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUN
 echo "==> Testing..."
 go test ./...
 
+# speech-server links whisper.cpp's libparakeet and libwhisper through cgo.
+# Where their headers and libraries are is host setup: a build file outside
+# the repo sets CGO_CFLAGS and CGO_LDFLAGS (README "Host setup").
+SPEECH_SERVER_BUILD_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/speech-server/build.env"
+if [ ! -f "$SPEECH_SERVER_BUILD_ENV" ]; then
+  echo "ERROR: $SPEECH_SERVER_BUILD_ENV is missing; it sets CGO_CFLAGS and CGO_LDFLAGS for speech-server (README \"Host setup\")"
+  exit 1
+fi
+echo "==> Building speech-server..."
+( set -a; . "$SPEECH_SERVER_BUILD_ENV"; set +a; cd speech-server && go vet . && go build -o speech-server . )
+
 echo "==> Building $BINARY..."
 go build -o "$BINARY" ./cmd/voice-intake
 echo "    built: $(ls -lh "$BINARY" | awk '{print $5}')"
@@ -41,6 +52,21 @@ fi
 echo "==> Installing systemd unit..."
 mkdir -p "$(dirname "$UNIT_DEST")"
 cp "$UNIT_SRC" "$UNIT_DEST"
+
+echo "==> Installing and restarting speech-server..."
+cp "$REPO_DIR/speech-server.service" "$HOME/.config/systemd/user/speech-server.service"
+systemctl --user stop speech-server.service 2>/dev/null || true
+cp speech-server/speech-server "$BIN_DIR/speech-server"
+systemctl --user daemon-reload
+systemctl --user enable speech-server.service >/dev/null
+systemctl --user start speech-server.service
+SPEECH_ADDR="$(sed -n 's/^Environment=SPEECH_SERVER_ADDR=//p' "$REPO_DIR/speech-server.service")"
+for attempt in $(seq 1 30); do
+  curl -sf "http://$SPEECH_ADDR/health" >/dev/null && break
+  sleep 1
+done
+curl -sfS "http://$SPEECH_ADDR/health" >/dev/null || { echo "ERROR: speech-server did not answer /health"; journalctl --user -u speech-server.service -n 20 --no-pager; exit 1; }
+echo "    speech-server answers on $SPEECH_ADDR"
 
 echo "==> Stopping $SERVICE..."
 systemctl --user stop "$SERVICE" 2>/dev/null || true
