@@ -241,12 +241,38 @@ func (run *utteranceRun) processReadySegments() {
 		if !ready || cancelled {
 			return
 		}
-		run.processSegment(segment)
+		// A segment with no words (an audio segment whose transcript came
+		// back empty) holds its index so later ones are not kept waiting,
+		// and changes nothing else: no dispatch, and the continuation
+		// window still runs from the last segment that had words.
+		spoken := hasWords(segment)
+		if spoken {
+			run.processSegment(segment)
+		}
 		run.mutex.Lock()
 		run.nextIndex = segment.Index + 1
 		run.mutex.Unlock()
-		run.scheduleWindowExpiry(segment)
+		if spoken {
+			run.scheduleWindowExpiry(segment)
+		}
 	}
+}
+
+func hasWords(segment Segment) bool { return strings.TrimSpace(segment.Text) != "" }
+
+// previousSpokenSegment is the nearest segment before index that had words.
+// The caller holds run.mutex.
+func (run *utteranceRun) previousSpokenSegment(index int) (Segment, bool) {
+	for earlier := index - 1; earlier >= 0; earlier-- {
+		segment, known := run.segments[earlier]
+		if !known {
+			return Segment{}, false
+		}
+		if hasWords(segment) {
+			return segment, true
+		}
+	}
+	return Segment{}, false
 }
 
 func (run *utteranceRun) processSegment(segment Segment) {
@@ -260,7 +286,7 @@ func (run *utteranceRun) processSegment(segment Segment) {
 	if len(run.groups) > 0 {
 		last = run.groups[len(run.groups)-1]
 	}
-	previous, havePrevious := run.segments[segment.Index-1]
+	previous, havePrevious := run.previousSpokenSegment(segment.Index)
 	final := run.final
 	run.mutex.Unlock()
 
@@ -280,7 +306,7 @@ func (run *utteranceRun) processSegment(segment Segment) {
 	if final || !havePrevious || gapMs > windowMs {
 		why := "the utterance's decisions were already final"
 		if !final && !havePrevious {
-			why = fmt.Sprintf("segment %d was not handled by this process", segment.Index-1)
+			why = fmt.Sprintf("no segment with words before segment %d was handled by this process", segment.Index)
 		} else if !final {
 			why = fmt.Sprintf("segment %d arrived %d ms after segment %d's speech end, past the %d ms continuation window", segment.Index, gapMs, previous.Index, windowMs)
 		}
@@ -611,11 +637,18 @@ func (run *utteranceRun) scheduleWindowExpiry(segment Segment) {
 	}
 	run.windowTimer = time.AfterFunc(wait, func() {
 		run.enqueue(func() {
+			// Segments after this one that had no words do not count as
+			// following it.
 			run.mutex.Lock()
-			_, newerArrived := run.segments[segment.Index+1]
-			handledThrough := run.nextIndex - 1
+			followed := false
+			for index, later := range run.segments {
+				if index > segment.Index && (index >= run.nextIndex || hasWords(later)) {
+					followed = true
+					break
+				}
+			}
 			run.mutex.Unlock()
-			if newerArrived || handledThrough != segment.Index {
+			if followed {
 				return
 			}
 			run.finalize(fmt.Sprintf("no segment followed segment %d within the %d ms continuation window", segment.Index, window.Milliseconds()))
@@ -705,6 +738,17 @@ func (run *utteranceRun) recordError(message string) {
 		log.Printf("[dispatch] ERROR %s: record error: %v", run.utteranceID, err)
 	}
 	run.hub.publish(eventError, map[string]any{"message": message})
+}
+
+// RecordError writes a failure to the utterance's errors and sends it on the
+// event stream, so the phone hears of it.
+func (d *Dispatcher) RecordError(utterance Utterance, message string) error {
+	run, err := d.runFor(utterance)
+	if err != nil {
+		return err
+	}
+	run.recordError(message)
+	return nil
 }
 
 // ReceiveAudio keeps the recording and shares it into every session the

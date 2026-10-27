@@ -6,7 +6,7 @@ import (
 )
 
 // latencyGroupings are the group_by values GET /api/voice/latency takes.
-var latencyGroupings = map[string]bool{"strategy": true, "pooled": true, "trigger": true}
+var latencyGroupings = map[string]bool{"strategy": true, "pooled": true, "trigger": true, "source": true}
 
 // LatencyGroup is one group's sample count and medians, in milliseconds.
 // A median is null when no sample in the group has both ends of it.
@@ -25,6 +25,8 @@ var latencyMeasures = []struct {
 	read func(LatencySample) *int64
 }{
 	{"speech_end_to_received", func(s LatencySample) *int64 { return difference(&s.SpeechEndedAtMs, &s.SegmentReceivedAtMs) }},
+	{"transcription", func(s LatencySample) *int64 { return difference(s.TranscriptionStartedAtMs, s.TranscribedAtMs) }},
+	{"speech_end_to_transcribed", func(s LatencySample) *int64 { return difference(&s.SpeechEndedAtMs, s.TranscribedAtMs) }},
 	{"received_to_dispatched", func(s LatencySample) *int64 { return difference(&s.SegmentReceivedAtMs, s.DispatchedAtMs) }},
 	{"speech_end_to_dispatched", func(s LatencySample) *int64 { return difference(&s.SpeechEndedAtMs, s.DispatchedAtMs) }},
 	{"dispatched_to_first_block", func(s LatencySample) *int64 { return difference(s.DispatchedAtMs, s.FirstBlockAtMs) }},
@@ -53,6 +55,8 @@ func LatencyMedians(samples []LatencySample, groupBy string) []LatencyGroup {
 			key = sample.Trigger
 		case "pooled":
 			key = strconv.FormatBool(sample.Pooled)
+		case "source":
+			key = sample.Source
 		}
 		byGroup[key] = append(byGroup[key], sample)
 	}

@@ -30,6 +30,7 @@ time with it. Both values are stored.
 |-------|------|
 | `POST /api/voice/utterances` | `{"client_utterance_id","mode","strategy","trigger","speech_started_at_ms"}` → 201 `{"utterance_id":"utterance_000001"}`; the same `client_utterance_id` again → 200, same row |
 | `POST /api/voice/utterances/{id}/segments` | `{"index","text","speech_ended_at_ms"}` → 202 and dispatch; an index already received → 200, ignored; after cancel → 409 |
+| `POST /api/voice/utterances/{id}/segments/{index}/audio?speech_ended_at_ms=…` | body the segment's sound, `audio/wav`, 16 kHz mono 16-bit PCM; transcribed, then handled as a text segment with that index → 202 `{"text","transcription_ms","audio_duration_ms","status":"accepted"}`; no words → 200 `"status":"no words"`, stored, not dispatched; an index already received → 200, not transcribed; after cancel → 409; transcription failed → 502, nothing stored; no transcription service set → 503 (an addition: see *Contract changes*) |
 | `POST /api/voice/utterances/{id}/finish` | `{"ended_at_ms"}` → 200; decisions become final once every received segment is handled |
 | `POST /api/voice/utterances/{id}/cancel` | → 200; stops every session the utterance started |
 | `POST /api/voice/utterances/{id}/audio?filename=…` | body the bytes, `audio/wav`, `audio/ogg` or `audio/flac` → 200 `{"shared_into":[…]}`; kept in the data directory and shared into every session the utterance still keeps, and into any it starts later |
@@ -37,7 +38,7 @@ time with it. Both values are stored.
 | `GET /api/voice/utterances?limit=50` | the caller's utterances, newest first |
 | `GET /api/voice/utterances/{id}/events` | Server-Sent Events, below |
 | `GET /api/voice/settings`, `PATCH /api/voice/settings` | the settings below; an unknown field or a value of the wrong type is 400 and nothing is written |
-| `GET /api/voice/latency?group_by=strategy\|pooled\|trigger` | median intervals per group, below |
+| `GET /api/voice/latency?group_by=strategy\|pooled\|trigger\|source` | median intervals per group, below |
 | `GET /health` | `{"status":"ok"}` |
 | `GET /settings` | every setting, where its value came from; secrets only as set or not |
 
@@ -55,6 +56,12 @@ quiet stream; the answer carries `X-Accel-Buffering: no`.
 - `event: done` `{}`
 
 ## How segments are dispatched
+
+A segment posted as audio is transcribed first (below) and from then on is
+the same as one posted as text. A segment whose transcript has no words
+holds its index, so later segments do not wait for it, and is otherwise
+skipped: it starts no session, and the continuation window runs from the
+last segment that had words.
 
 - **Segment 0** goes at once to a waiting pooled session when one is ready and its text runs at the default effort; otherwise to a new session. Its role is `speculative`.
 - **Segment k within the continuation window** — received no later than `continuation_window_ms` after segment k−1's speech end — starts three things at the same moment: a session for the latest request's segments joined with segment k, a session for segment k alone, and a question to the continuation judge. When the judge says *continues*, the joined session is kept and the earlier one and the lone one are superseded. When it says *separate*, the earlier session is kept, the lone one is `separate`, and the joined one is superseded. A superseded session is stopped at once and moved to the chat's Archive.
@@ -78,14 +85,28 @@ records whether it was pooled and the state the pooled session was in, so
 pooled and fresh sessions can be compared. Changing a setting the pool
 depends on gives up the waiting sessions that no longer match.
 
+## Transcription
+
+`POST …/segments/{index}/audio` sends the WAV to the whisper.cpp
+`whisper-server` at `VOICE_INTAKE_TRANSCRIPTION_URL` (its inference route),
+at temperature 0 and whisper's full 30-second audio context: a context sized
+to the clip was about three times faster when measured, but repeated
+sentences and turned silence into words. The transcript is kept as the
+server gave it (`transcript_raw`); the segment's text is that with
+whitespace joined into single spaces, and empty when it is only a marker
+such as `[BLANK_AUDIO]`. A failed transcription is written to the
+utterance's errors and sent as `event: error`, and stores no segment, so the
+phone may send the same index again.
+
 ## Timings and latency
 
 All times are milliseconds since the epoch, server clock. Per utterance:
 speech start, received, finished, finalized, cancelled. Per segment: speech
-end, received. Per session: dispatch started, dispatched (the send returned),
-first `block` event, `result` event, stopped. `GET /api/voice/latency` groups
+end, received, and for audio segments transcription started and ended
+(`transcription_ms` is the difference). Per session: dispatch started, dispatched (the send returned),
+first `block` event, `result` event, stopped. `GET /api/voice/latency?group_by=strategy|pooled|trigger|source` groups
 every dispatched session and reports, per group, the median of
-`speech_end_to_received`, `received_to_dispatched`, `speech_end_to_dispatched`,
+`speech_end_to_received`, `transcription`, `speech_end_to_transcribed`, `received_to_dispatched`, `speech_end_to_dispatched`,
 `dispatched_to_first_block`, `dispatched_to_result`, `speech_end_to_first_block`
 and `speech_end_to_result`, each measured from the speech end of the last
 segment the session's text holds, with the number of samples behind each.
@@ -113,7 +134,9 @@ llm-bridge-server's instances; when the owner cannot be asked the answer is
 
 Read only from the environment: `VOICE_INTAKE_ADDR` (127.0.0.1:8332),
 `VOICE_INTAKE_DATA_DIR`, `VOICE_INTAKE_LLM_BRIDGE_URL`,
-`VOICE_INTAKE_MODEL_STORE_URL`, `VOICE_INTAKE_SESSION_WORKING_DIR` (empty: the
+`VOICE_INTAKE_MODEL_STORE_URL`, `VOICE_INTAKE_TRANSCRIPTION_URL` (a
+whisper-server inference route, such as `http://127.0.0.1:<port>/inference`;
+empty: the segment audio route answers 503), `VOICE_INTAKE_SESSION_WORKING_DIR` (empty: the
 instance's directory), `VOICE_INTAKE_RAISED_EFFORT` (high), and
 `LLMBRIDGE_SERVICE_TOKEN` (required). A set `VOICE_INTAKE_` variable that is
 not declared stops the start.
@@ -122,8 +145,9 @@ not declared stops the start.
 
 The unit file sets only the listen address. Put the rest in a host-local
 drop-in, `~/.config/systemd/user/voice-intake.service.d/host.conf`, mode 600:
-an `EnvironmentFile=` holding `LLMBRIDGE_SERVICE_TOKEN`, and the instance and
-working directory. The prompt every voice session reads is the project prompt
+an `EnvironmentFile=` holding `LLMBRIDGE_SERVICE_TOKEN`, the instance and
+working directory, and `VOICE_INTAKE_TRANSCRIPTION_URL`. The whisper-server it
+names is run by the host, not by this repo. The prompt every voice session reads is the project prompt
 collection rooted at `VOICE_INTAKE_SESSION_WORKING_DIR`, kept in agent-store
 like any other prompt; Claude Code reads its rendered `CLAUDE.md` because the
 session starts there.
@@ -151,4 +175,7 @@ which a client that ignores unknown fields and events has to handle:
 
 - `event: error` `{"message"}` on the event stream, when a session could not be started, sent to or stopped, so such a failure does not reach the phone as silence.
 - The 202 and 200 answers to segments, finish and cancel carry a small JSON body (`utterance_id`, `status`); the audio answer carries `shared_into`.
+- `POST /api/voice/utterances/{id}/segments/{index}/audio`: the phone may send a segment's sound instead of its text, and the service transcribes it. Answers as in *Routes*. A transcript with no words uses up the index; a failed transcription does not.
+- Each segment in `GET /api/voice/utterances/{id}` carries `source` (`text` or `audio`), and an audio one also `audio_size_bytes`, `audio_duration_ms`, `transcription_started_at_ms`, `transcribed_at_ms`, `transcription_ms` and `transcript_raw`. An audio segment with no words appears with empty `text`.
+- `GET /api/voice/latency` takes `group_by=source` and reports two more medians, `transcription` and `speech_end_to_transcribed`.
 - `GET /api/voice/utterances/{id}` and the list carry more fields than the contract names: the phone's own timestamps beside the server-time ones, the clock skew, audio details, errors and the continuation judgments.

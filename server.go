@@ -40,14 +40,17 @@ type Server struct {
 	pool       *SessionPool
 	registry   *servicesettings.Registry
 	now        func() time.Time
+	// transcriber is nil when no transcription service is set, and then the
+	// segment audio route answers 503.
+	transcriber SpeechTranscriber
 	// settingValidators check a new value with the service that owns what
 	// it names.
 	settingValidators map[string]func(ctx context.Context, value string) error
 }
 
 // NewServer builds the API.
-func NewServer(store *Store, dispatcher *Dispatcher, pool *SessionPool, registry *servicesettings.Registry, now func() time.Time) *Server {
-	return &Server{store: store, dispatcher: dispatcher, pool: pool, registry: registry, now: now,
+func NewServer(store *Store, dispatcher *Dispatcher, pool *SessionPool, registry *servicesettings.Registry, transcriber SpeechTranscriber, now func() time.Time) *Server {
+	return &Server{store: store, dispatcher: dispatcher, pool: pool, registry: registry, transcriber: transcriber, now: now,
 		settingValidators: map[string]func(ctx context.Context, value string) error{}}
 }
 
@@ -63,6 +66,7 @@ func (s *Server) Handler() http.Handler {
 	voice.HandleFunc("GET /api/voice/utterances", s.listUtterances)
 	voice.HandleFunc("GET /api/voice/utterances/{id}", s.getUtterance)
 	voice.HandleFunc("POST /api/voice/utterances/{id}/segments", s.postSegment)
+	voice.HandleFunc("POST /api/voice/utterances/{id}/segments/{index}/audio", s.postSegmentAudio)
 	voice.HandleFunc("POST /api/voice/utterances/{id}/finish", s.finishUtterance)
 	voice.HandleFunc("POST /api/voice/utterances/{id}/cancel", s.cancelUtterance)
 	voice.HandleFunc("POST /api/voice/utterances/{id}/audio", s.postAudio)
@@ -270,7 +274,7 @@ func (s *Server) postSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	segment := Segment{UtteranceID: utterance.UtteranceID, Index: *body.Index, Text: body.Text, SpeechEndedAtClientMs: *body.SpeechEndedAtMs,
-		SpeechEndedAtMs: *body.SpeechEndedAtMs + skew, ClientClockSkewMs: skew, ReceivedAtMs: receivedAtMs}
+		SpeechEndedAtMs: *body.SpeechEndedAtMs + skew, ClientClockSkewMs: skew, ReceivedAtMs: receivedAtMs, Source: SegmentSourceText}
 	inserted, err := s.store.InsertSegment(segment)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -285,6 +289,119 @@ func (s *Server) postSegment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"utterance_id": utterance.UtteranceID, "index": segment.Index, "status": "accepted"})
+}
+
+// segmentTranscriptionLimit bounds one transcription: a whole long recording
+// sent as one segment takes the longest.
+const segmentTranscriptionLimit = 5 * time.Minute
+
+// postSegmentAudio takes a segment as sound: it has the WAV transcribed and
+// then handles the text as postSegment would. A transcript with no words is
+// stored, so its index is used, and not dispatched. A failed transcription
+// stores nothing, so the index stays free.
+func (s *Server) postSegmentAudio(w http.ResponseWriter, r *http.Request) {
+	receivedAtMs := s.now().UnixMilli()
+	utterance, ok := s.ownedUtterance(w, r)
+	if !ok {
+		return
+	}
+	index, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil || index < 0 {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("segment index %q must be a whole number from 0", r.PathValue("index")))
+		return
+	}
+	skew, err := s.clientClockSkewMs(r, receivedAtMs)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Without speech_ended_at_ms, the speech is taken to have ended when the
+	// request arrived.
+	speechEndedAtClientMs := receivedAtMs - skew
+	if raw := r.URL.Query().Get("speech_ended_at_ms"); raw != "" {
+		if speechEndedAtClientMs, err = strconv.ParseInt(raw, 10, 64); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("speech_ended_at_ms %q is not epoch milliseconds", raw))
+			return
+		}
+	}
+	contentType := strings.TrimSpace(strings.Split(r.Header.Get("Content-Type"), ";")[0])
+	if contentType != "audio/wav" {
+		writeError(w, http.StatusUnsupportedMediaType, fmt.Sprintf("Content-Type %q: this route takes audio/wav, 16 kHz mono 16-bit PCM", contentType))
+		return
+	}
+	if utterance.CancelledAtMs != nil {
+		writeError(w, http.StatusConflict, utterance.UtteranceID+" was cancelled")
+		return
+	}
+	alreadyReceived := func() {
+		writeJSON(w, http.StatusOK, map[string]any{"utterance_id": utterance.UtteranceID, "index": index, "status": "already received"})
+	}
+	// Ask before transcribing, so a repeated upload costs no transcription.
+	received, err := s.store.SegmentReceived(utterance.UtteranceID, index)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if received {
+		alreadyReceived()
+		return
+	}
+	wav, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maximumAudioBytes))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	durationMs, err := wavDurationMs(wav)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.transcriber == nil {
+		writeError(w, http.StatusServiceUnavailable, "no transcription service is set: "+SettingTranscriptionURL+" (VOICE_INTAKE_TRANSCRIPTION_URL) is empty")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), segmentTranscriptionLimit)
+	defer cancel()
+	transcriptionStartedAtMs := s.now().UnixMilli()
+	rawTranscript, err := s.transcriber.Transcribe(ctx, wav)
+	transcribedAtMs := s.now().UnixMilli()
+	if err != nil {
+		message := fmt.Sprintf("segment %d: transcription failed after %d ms: %v", index, transcribedAtMs-transcriptionStartedAtMs, err)
+		if recordErr := s.dispatcher.RecordError(utterance, message); recordErr != nil {
+			log.Printf("[segments] ERROR %s: record error: %v", utterance.UtteranceID, recordErr)
+		}
+		writeError(w, http.StatusBadGateway, message)
+		return
+	}
+	sizeBytes := int64(len(wav))
+	segment := Segment{UtteranceID: utterance.UtteranceID, Index: index, Text: spokenText(rawTranscript), SpeechEndedAtClientMs: speechEndedAtClientMs,
+		SpeechEndedAtMs: speechEndedAtClientMs + skew, ClientClockSkewMs: skew, ReceivedAtMs: receivedAtMs, Source: SegmentSourceAudio,
+		AudioSizeBytes: &sizeBytes, AudioDurationMs: &durationMs, TranscriptionStartedAtMs: &transcriptionStartedAtMs, TranscribedAtMs: &transcribedAtMs,
+		TranscriptRaw: rawTranscript}
+	inserted, err := s.store.InsertSegment(segment)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !inserted {
+		alreadyReceived()
+		return
+	}
+	// A segment with no words still goes to the dispatcher, which steps past
+	// its index.
+	if err := s.dispatcher.SegmentArrived(utterance, segment); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	answer := map[string]any{"utterance_id": utterance.UtteranceID, "index": index, "text": segment.Text,
+		"transcription_ms": transcribedAtMs - transcriptionStartedAtMs, "audio_duration_ms": durationMs}
+	if segment.Text == "" {
+		answer["status"] = "no words"
+		writeJSON(w, http.StatusOK, answer)
+		return
+	}
+	answer["status"] = "accepted"
+	writeJSON(w, http.StatusAccepted, answer)
 }
 
 func (s *Server) finishUtterance(w http.ResponseWriter, r *http.Request) {

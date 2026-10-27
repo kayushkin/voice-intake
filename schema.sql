@@ -35,6 +35,14 @@ CREATE TABLE IF NOT EXISTS segments (
     speech_ended_at_ms           INTEGER NOT NULL,
     client_clock_skew_ms         INTEGER NOT NULL,
     received_at_ms               INTEGER NOT NULL,
+    -- 'text' when the phone sent the words, 'audio' when it sent the sound
+    -- and this service had it transcribed. The columns below are for audio.
+    source                       TEXT NOT NULL DEFAULT 'text',
+    audio_size_bytes             INTEGER,
+    audio_duration_ms            INTEGER,
+    transcription_started_at_ms  INTEGER,
+    transcribed_at_ms            INTEGER,
+    transcript_raw               TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (utterance_id, segment_index)
 );
 

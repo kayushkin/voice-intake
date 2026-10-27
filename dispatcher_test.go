@@ -180,12 +180,15 @@ func newHarness(t *testing.T, environment map[string]string) *harness {
 	if err := registry.AttachStoredValues(store.Settings(), nil); err != nil {
 		t.Fatal(err)
 	}
+	fakeWhisper := httptest.NewServer(http.HandlerFunc(fakeWhisperServer))
+	t.Cleanup(fakeWhisper.Close)
+	transcriber := NewWhisperServerTranscriber(fakeWhisper.URL + "/inference")
 	bridge := newFakeBridge()
 	judge := &fakeJudge{continues: map[string]bool{"in São Paulo": true, "can you add cheese to my burger": false}, delay: 30 * time.Millisecond}
 	settings := func() DispatchSettings { return DispatchSettingsFrom(registry) }
 	pool := NewSessionPool(store, bridge, settings, time.Now)
 	dispatcher := NewDispatcher(store, bridge, judge, pool, settings, time.Now, directory+"/audio")
-	server := NewServer(store, dispatcher, pool, registry, time.Now)
+	server := NewServer(store, dispatcher, pool, registry, transcriber, time.Now)
 	registry.OnChange(func(string) { pool.Resync(context.Background()) })
 	httpServer := httptest.NewServer(server.Handler())
 	t.Cleanup(httpServer.Close)

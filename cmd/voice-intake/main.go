@@ -41,7 +41,13 @@ func main() {
 	settings := func() voiceintake.DispatchSettings { return voiceintake.DispatchSettingsFrom(registry) }
 	pool := voiceintake.NewSessionPool(store, bridge, settings, time.Now)
 	dispatcher := voiceintake.NewDispatcher(store, bridge, judge, pool, settings, time.Now, filepath.Join(dataDirectory, "audio"))
-	server := voiceintake.NewServer(store, dispatcher, pool, registry, time.Now)
+	var transcriber voiceintake.SpeechTranscriber
+	if transcriptionURL := registry.String(voiceintake.SettingTranscriptionURL); transcriptionURL != "" {
+		transcriber = voiceintake.NewWhisperServerTranscriber(transcriptionURL)
+	} else {
+		log.Printf("voice-intake: VOICE_INTAKE_TRANSCRIPTION_URL is empty; POST …/segments/{index}/audio will answer 503")
+	}
+	server := voiceintake.NewServer(store, dispatcher, pool, registry, transcriber, time.Now)
 
 	modelStoreURL := strings.TrimRight(registry.String(voiceintake.SettingModelStoreURL), "/")
 	server.SetSettingValidator(voiceintake.SettingContinuationJudgeModelRole, func(ctx context.Context, role string) error {

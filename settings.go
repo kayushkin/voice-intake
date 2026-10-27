@@ -31,6 +31,7 @@ const (
 	SettingModelStoreURL           = "model_store_url"
 	SettingSessionWorkingDirectory = "session_working_directory"
 	SettingRaisedEffort            = "raised_effort"
+	SettingTranscriptionURL        = "transcription_url"
 )
 
 // Keys of the settings the phone and the operator read and change through
@@ -78,6 +79,8 @@ func SettingDefinitions() []servicesettings.Definition {
 			Description: "Where model-store answers: a new continuation_judge_model_role is checked against its roles and a new default_model against its models."},
 		{Key: SettingSessionWorkingDirectory, EnvironmentVariable: "VOICE_INTAKE_SESSION_WORKING_DIR", Kind: path, ValueType: text,
 			Description: "The working directory of every voice session. The prompt a voice session reads is the project prompt collection rooted here. Empty leaves the instance's own directory."},
+		{Key: SettingTranscriptionURL, EnvironmentVariable: "VOICE_INTAKE_TRANSCRIPTION_URL", Kind: wiring, ValueType: text,
+			Description: "The inference route of a whisper.cpp whisper-server, for example http://127.0.0.1:<port>/inference. Segment audio posted to /segments/{index}/audio is transcribed there. Empty: that route answers 503."},
 		{Key: SettingRaisedEffort, EnvironmentVariable: "VOICE_INTAKE_RAISED_EFFORT", Kind: behaviour, ValueType: text, Default: "high",
 			Description: "The effort a session runs at when its text contains one of effort_raising_phrases."},
 

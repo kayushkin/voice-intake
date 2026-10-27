@@ -48,7 +48,39 @@ func OpenStore(dataDirectory string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	if err := addMissingColumns(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// columnsAddedAfterTheFirstSchema are columns a database made by an earlier
+// schema lacks, since CREATE TABLE IF NOT EXISTS leaves an existing table as
+// it is. Each is added once, with the same definition as in schema.sql.
+var columnsAddedAfterTheFirstSchema = []struct{ table, column, definition string }{
+	{"segments", "source", "TEXT NOT NULL DEFAULT 'text'"},
+	{"segments", "audio_size_bytes", "INTEGER"},
+	{"segments", "audio_duration_ms", "INTEGER"},
+	{"segments", "transcription_started_at_ms", "INTEGER"},
+	{"segments", "transcribed_at_ms", "INTEGER"},
+	{"segments", "transcript_raw", "TEXT NOT NULL DEFAULT ''"},
+}
+
+func addMissingColumns(db *sql.DB) error {
+	for _, added := range columnsAddedAfterTheFirstSchema {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, added.table, added.column).Scan(&count); err != nil {
+			return fmt.Errorf("read columns of %s: %w", added.table, err)
+		}
+		if count > 0 {
+			continue
+		}
+		if _, err := db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, added.table, added.column, added.definition)); err != nil {
+			return fmt.Errorf("add column %s.%s: %w", added.table, added.column, err)
+		}
+	}
+	return nil
 }
 
 // Close closes the database.
@@ -118,7 +150,25 @@ type Segment struct {
 	SpeechEndedAtMs       int64  `json:"speech_ended_at_ms"`
 	ClientClockSkewMs     int64  `json:"client_clock_skew_ms"`
 	ReceivedAtMs          int64  `json:"received_at_ms"`
+	// Source is SegmentSourceText or SegmentSourceAudio. The fields after it
+	// are set only for audio: the WAV's size and length, when transcription
+	// started and ended, how long it took, and the transcript as the
+	// transcription service gave it, before whitespace was joined and a
+	// non-speech marker dropped.
+	Source                   string `json:"source"`
+	AudioSizeBytes           *int64 `json:"audio_size_bytes,omitempty"`
+	AudioDurationMs          *int64 `json:"audio_duration_ms,omitempty"`
+	TranscriptionStartedAtMs *int64 `json:"transcription_started_at_ms,omitempty"`
+	TranscribedAtMs          *int64 `json:"transcribed_at_ms,omitempty"`
+	TranscriptionMs          *int64 `json:"transcription_ms,omitempty"`
+	TranscriptRaw            string `json:"transcript_raw,omitempty"`
 }
+
+// Where a segment's text came from.
+const (
+	SegmentSourceText  = "text"
+	SegmentSourceAudio = "audio"
+)
 
 // Session roles. A session starts speculative; a decision makes it kept,
 // separate or superseded.
@@ -304,9 +354,14 @@ func (s *Store) AppendUtteranceError(utteranceID, message string) error {
 // InsertSegment stores a segment; inserted is false when the index was
 // already received, and then nothing changes.
 func (s *Store) InsertSegment(segment Segment) (bool, error) {
-	result, err := s.db.Exec(`INSERT INTO segments (utterance_id, segment_index, text, speech_ended_at_client_ms, speech_ended_at_ms, client_clock_skew_ms, received_at_ms)
-		VALUES (?,?,?,?,?,?,?) ON CONFLICT (utterance_id, segment_index) DO NOTHING`,
-		segment.UtteranceID, segment.Index, segment.Text, segment.SpeechEndedAtClientMs, segment.SpeechEndedAtMs, segment.ClientClockSkewMs, segment.ReceivedAtMs)
+	if segment.Source != SegmentSourceText && segment.Source != SegmentSourceAudio {
+		return false, fmt.Errorf("segment %d of %s: source %q is neither %q nor %q", segment.Index, segment.UtteranceID, segment.Source, SegmentSourceText, SegmentSourceAudio)
+	}
+	result, err := s.db.Exec(`INSERT INTO segments (utterance_id, segment_index, text, speech_ended_at_client_ms, speech_ended_at_ms, client_clock_skew_ms, received_at_ms,
+		source, audio_size_bytes, audio_duration_ms, transcription_started_at_ms, transcribed_at_ms, transcript_raw)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (utterance_id, segment_index) DO NOTHING`,
+		segment.UtteranceID, segment.Index, segment.Text, segment.SpeechEndedAtClientMs, segment.SpeechEndedAtMs, segment.ClientClockSkewMs, segment.ReceivedAtMs,
+		segment.Source, segment.AudioSizeBytes, segment.AudioDurationMs, segment.TranscriptionStartedAtMs, segment.TranscribedAtMs, segment.TranscriptRaw)
 	if err != nil {
 		return false, err
 	}
@@ -316,7 +371,8 @@ func (s *Store) InsertSegment(segment Segment) (bool, error) {
 
 // Segments returns an utterance's segments by index.
 func (s *Store) Segments(utteranceID string) ([]Segment, error) {
-	rows, err := s.db.Query(`SELECT utterance_id, segment_index, text, speech_ended_at_client_ms, speech_ended_at_ms, client_clock_skew_ms, received_at_ms
+	rows, err := s.db.Query(`SELECT utterance_id, segment_index, text, speech_ended_at_client_ms, speech_ended_at_ms, client_clock_skew_ms, received_at_ms,
+		source, audio_size_bytes, audio_duration_ms, transcription_started_at_ms, transcribed_at_ms, transcript_raw
 		FROM segments WHERE utterance_id = ? ORDER BY segment_index`, utteranceID)
 	if err != nil {
 		return nil, err
@@ -326,12 +382,21 @@ func (s *Store) Segments(utteranceID string) ([]Segment, error) {
 	for rows.Next() {
 		var segment Segment
 		if err := rows.Scan(&segment.UtteranceID, &segment.Index, &segment.Text, &segment.SpeechEndedAtClientMs, &segment.SpeechEndedAtMs,
-			&segment.ClientClockSkewMs, &segment.ReceivedAtMs); err != nil {
+			&segment.ClientClockSkewMs, &segment.ReceivedAtMs, &segment.Source, &segment.AudioSizeBytes, &segment.AudioDurationMs,
+			&segment.TranscriptionStartedAtMs, &segment.TranscribedAtMs, &segment.TranscriptRaw); err != nil {
 			return nil, err
 		}
+		segment.TranscriptionMs = difference(segment.TranscriptionStartedAtMs, segment.TranscribedAtMs)
 		segments = append(segments, segment)
 	}
 	return segments, rows.Err()
+}
+
+// SegmentReceived reports whether the utterance already holds this index.
+func (s *Store) SegmentReceived(utteranceID string, index int) (bool, error) {
+	var count int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM segments WHERE utterance_id = ? AND segment_index = ?`, utteranceID, index).Scan(&count)
+	return count > 0, err
 }
 
 // InsertUtteranceSession records a session an utterance sent text to.
@@ -504,15 +569,19 @@ func (s *Store) ReleasePooledSession(sessionID, reason string, atMs int64) error
 
 // LatencySample is one dispatched session with the utterance it served.
 type LatencySample struct {
-	Strategy            string
-	Trigger             string
-	Pooled              bool
-	SpeechEndedAtMs     int64
-	SegmentReceivedAtMs int64
-	DispatchStartedAtMs int64
-	DispatchedAtMs      *int64
-	FirstBlockAtMs      *int64
-	ResultAtMs          *int64
+	Strategy string
+	Trigger  string
+	Pooled   bool
+	// Source is the source of the last segment the session's text holds.
+	Source                   string
+	TranscriptionStartedAtMs *int64
+	TranscribedAtMs          *int64
+	SpeechEndedAtMs          int64
+	SegmentReceivedAtMs      int64
+	DispatchStartedAtMs      int64
+	DispatchedAtMs           *int64
+	FirstBlockAtMs           *int64
+	ResultAtMs               *int64
 }
 
 // LatencySamples returns every dispatched session, measured from the speech
@@ -553,8 +622,10 @@ func (s *Store) LatencySamples() ([]LatencySample, error) {
 	rows.Close()
 	samples := make([]LatencySample, 0, len(pendings))
 	for _, p := range pendings {
-		if err := s.db.QueryRow(`SELECT speech_ended_at_ms, received_at_ms FROM segments WHERE utterance_id = ? AND segment_index = ?`,
-			p.utteranceID, p.lastIndex).Scan(&p.sample.SpeechEndedAtMs, &p.sample.SegmentReceivedAtMs); err != nil {
+		if err := s.db.QueryRow(`SELECT speech_ended_at_ms, received_at_ms, source, transcription_started_at_ms, transcribed_at_ms
+			FROM segments WHERE utterance_id = ? AND segment_index = ?`,
+			p.utteranceID, p.lastIndex).Scan(&p.sample.SpeechEndedAtMs, &p.sample.SegmentReceivedAtMs, &p.sample.Source,
+			&p.sample.TranscriptionStartedAtMs, &p.sample.TranscribedAtMs); err != nil {
 			return nil, fmt.Errorf("segment %d of %s: %w", p.lastIndex, p.utteranceID, err)
 		}
 		samples = append(samples, p.sample)
