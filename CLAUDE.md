@@ -1,0 +1,39 @@
+# About voice-intake
+
+## What it owns
+
+`127.0.0.1:8332` (`VOICE_INTAKE_ADDR`, loopback by default). Speech from the phone in, agent sessions out: the phone posts an utterance (one press of a trigger) and then each segment of speech as it ends, and this service sends the text into llm-bridge-server sessions created **as the signed-in person**, so each request is a real conversation in that person's chat, and streams the sessions' events back. It owns the utterances, segments, which session each segment went to and the role it was given, the decisions and their reasons, the continuation judge's answers, the pool of waiting sessions, and the timings. It owns no session: llm-bridge-server does. SQLite at `voice-intake.db` in `VOICE_INTAKE_DATA_DIR`, ids `utterance_000001`. **The phone-facing API is a fixed contract** that an Android app is built against: README "Routes" and "Events" are the contract as served, and README "Contract changes" lists every addition. Do not change a route, field or event the phone reads; add, and write the addition there.
+
+## Where this prompt lives
+
+These sections are stored in agent-store as a project prompt collection and rendered, with identical text, to `AGENTS.md` and `CLAUDE.md` at the root of this repo, so that whichever file a harness reads it gets the same thing. Edit them on dash `/files`, or edit either rendered file: the 15-minute scan carries the edit back into the sections and out to the other file. The host prompt keeps one row for this repo with only what an agent elsewhere needs.
+
+# How it works
+
+## Dispatch and decisions
+
+`dispatcher.go`. Each utterance has one `utteranceRun` whose worker handles segments **one at a time, in index order**, so a segment never joins onto a session about to be superseded. Segment 0 goes to a pooled session when one is ready and the text runs at the default effort, else to a new one (`dispatch`). A later segment received within `continuation_window_ms` of the previous segment's speech end starts, at the same moment, a session for the latest request joined with it, a session for it alone, and a question to the judge (`judge.go`, llm-bridge-server `POST /oneshot` on `continuation_judge_model_role` with a JSON schema); the judge's answer keeps the joined one (the earlier and the lone one superseded) or the earlier one plus the lone one as `separate` (the joined one superseded). A judge failure keeps the joined one, which carries every word, and says so in the reason. Past the window a segment is separate without asking. A superseded session is stopped and archived at once (`stopSession`), and its events stop being passed on. `finalize` runs on finish or when the window passes and keeps every session still speculative. `checkDone` sends `done` once the decisions are final and every session not superseded has its `result` (or five minutes pass, `sessionTurnLimit`). The event hub (`event_hub.go`) keeps the whole history, so a late subscriber misses nothing. README "How segments are dispatched" says the same for a reader outside the code: keep the two in step.
+
+## The pool, and the prompt voice sessions read
+
+`session_pool.go` keeps `pool_size` started sessions per person, each matching the default effort, model, instance and working directory; it fills a person's pool at their first utterance and, at start, for everyone with one. `Take` asks the bridge for the session's state and gives up one that is `aborted`, `error` or `disconnected`; a session the bridge's idle reaper stopped reads `completed` and is still used, because the bridge resumes it. A settings change runs `Resync`, which gives up the sessions that no longer match. **Voice sessions get their prompt from the session working directory**, not from `append_system_prompt` or `system_prompt` in `harness_config`, which would override the context the bridge injects: `VOICE_INTAKE_SESSION_WORKING_DIR` is the root of a project prompt collection in agent-store, and Claude Code reads its rendered `CLAUDE.md` because the session starts there. That directory and its collection are host setup, not part of this repo; the noteboard note tagged `voice-intake` names them. Sessions are `interactive`, purpose `voice`, origin `voice-intake`; llm-bridge's purpose registry does not list `voice` yet, so the bridge logs a taxonomy notice per create.
+
+## Timings
+
+Every time column is server epoch milliseconds. A phone timestamp is stored as sent (`*_client_ms`) and plus the skew of its own request (server time at receipt minus `X-Client-Now-Ms`). Per session: dispatch started, dispatched, first `block`, `result`, stopped, and whether it was pooled with the pooled session's state at the moment it was taken. `GET /api/voice/latency?group_by=strategy|pooled|trigger` takes medians per group in Go (`latency.go`), each interval measured from the speech end of the last segment the session's text holds. This table is how strategies and pooled-versus-fresh are compared: never drop a timing column, and add one rather than reuse one.
+
+# Access and operations
+
+## Who may call it
+
+Every `/api/voice/` route takes requests only from loopback and needs `X-Principal-Id` (403 off loopback, 401 without it; `requirePrincipalFromLoopback`). dash is the front door: it proxies `/api/voice/` unchanged and sets `X-Principal-Id` from the signed-in caller after deleting any the browser sent. An utterance of another principal is 404. `GET /health` and `GET /settings` are open on loopback. This service calls llm-bridge-server with its service token (`LLMBRIDGE_SERVICE_TOKEN`) and, when creating a session, `X-Principal-Id` naming the person; it calls model-store only to check a new judge role or default model.
+
+## Unit, settings and deploy
+
+User unit `voice-intake.service`, `%h/bin/voice-intake`. The committed unit sets only the address; the service token, `VOICE_INTAKE_INSTANCE_ID` and `VOICE_INTAKE_SESSION_WORKING_DIR` come from a host-local drop-in, `voice-intake.service.d/host.conf`, never from a tracked file. Every variable is declared once in `settings.go`; the nine contract settings are editable, stored in the database after the first start, and changed only through `PATCH /api/voice/settings`, which checks a judge role and a model with model-store and an instance with llm-bridge-server before writing anything. Deploy only with `./deploy.sh` from the main clone on `main`: it runs `~/bin/deploy-gate check`, the tests, the live-environment check, installs and restarts, smoke-checks the routes and the loopback bind, and records the deploy.
+
+# Working in this repo
+
+## Tests
+
+`go test -race ./...`. `dispatcher_test.go` drives the HTTP API against `fakeBridge` (a sent message produces a `block` then a `result`) and `fakeJudge` (answers by the new text): the weather / "in São Paulo" case keeps the joined session and stops the earlier one; weather / burger keeps the earlier one and the burger one as separate; a repeated segment index and a repeated `client_utterance_id` change nothing; cancel stops every session; a segment past the window is separate without the judge; the window passing finalizes without `finish`; an effort-raising phrase skips the pool. A live end-to-end run creates real sessions in the person's chat: stop and archive every one you create.

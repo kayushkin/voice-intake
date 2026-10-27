@@ -1,0 +1,22 @@
+[Unit]
+Description=voice-intake: speech transcripts from the phone in, agent sessions out
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/voice-intake
+
+# Loopback, deliberately: the service trusts X-Principal-Id only from loopback,
+# and dash is the front door. settings.go defaults to the same address.
+Environment=VOICE_INTAKE_ADDR=127.0.0.1:8332
+
+# The bridge service token, the instance and the session working directory are
+# host settings. They go in a host-local drop-in beside this unit, never here:
+# see README "Host setup".
+
+WorkingDirectory=%h/repos/voice-intake
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
