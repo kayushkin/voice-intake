@@ -78,7 +78,9 @@ func main() {
 	s := &server{transcriber: transcriber, vadModel: vadModel, streams: map[string]*VoiceActivityStream{}}
 	go s.closeIdleStreams()
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, http.StatusOK, map[string]string{"status": "ok"}) })
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 	mux.Handle("GET /settings", servicesettings.Handler(registry, "/settings"))
 	mux.HandleFunc("POST /inference", s.inference)
 	mux.HandleFunc("POST /vad/streams/{stream_id}", s.scoreStream)

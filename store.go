@@ -216,23 +216,23 @@ const (
 
 // UtteranceSession is one llm-bridge-server session an utterance sent text to.
 type UtteranceSession struct {
-	SessionID           string `json:"session_id"`
-	UtteranceID         string `json:"-"`
-	SegmentIndexes      []int  `json:"segment_indexes"`
-	Text                string `json:"text"`
-	Role                string `json:"role"`
-	Pooled              bool   `json:"pooled"`
-	PooledSessionState  string `json:"pooled_session_state"`
-	Effort              string `json:"effort"`
-	Model               string `json:"model"`
-	InstanceID          string `json:"instance_id"`
-	DispatchStartedAtMs int64  `json:"dispatch_started_at_ms"`
-	DispatchedAtMs      *int64 `json:"dispatched_at_ms"`
-	FirstBlockAtMs      *int64 `json:"first_block_at_ms"`
-	ResultAtMs          *int64 `json:"result_at_ms"`
-	StoppedAtMs         *int64 `json:"stopped_at_ms"`
-	StopReason          string `json:"stop_reason"`
-	Error               string `json:"error"`
+	SessionID           string   `json:"session_id"`
+	UtteranceID         string   `json:"-"`
+	SegmentIndexes      []int    `json:"segment_indexes"`
+	Text                string   `json:"text"`
+	Role                string   `json:"role"`
+	Pooled              bool     `json:"pooled"`
+	PooledSessionState  string   `json:"pooled_session_state"`
+	Effort              string   `json:"effort"`
+	Model               string   `json:"model"`
+	InstanceID          string   `json:"instance_id"`
+	DispatchStartedAtMs int64    `json:"dispatch_started_at_ms"`
+	DispatchedAtMs      *int64   `json:"dispatched_at_ms"`
+	FirstBlockAtMs      *int64   `json:"first_block_at_ms"`
+	ResultAtMs          *int64   `json:"result_at_ms"`
+	StoppedAtMs         *int64   `json:"stopped_at_ms"`
+	StopReason          string   `json:"stop_reason"`
+	Error               string   `json:"error"`
 	WorkingDirectory    string   `json:"working_directory"`
 	ReplyText           string   `json:"reply_text"`
 	TurnCostUSD         *float64 `json:"turn_cost_usd"`

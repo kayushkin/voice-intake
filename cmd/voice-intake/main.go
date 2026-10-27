@@ -41,13 +41,19 @@ func main() {
 	settings := func() voiceintake.DispatchSettings { return voiceintake.DispatchSettingsFrom(registry) }
 	pool := voiceintake.NewSessionPool(store, bridge, settings, time.Now)
 	dispatcher := voiceintake.NewDispatcher(store, bridge, judge, pool, settings, time.Now, filepath.Join(dataDirectory, "audio"))
-	var transcriber voiceintake.SpeechTranscriber
-	if transcriptionURL := registry.String(voiceintake.SettingTranscriptionURL); transcriptionURL != "" {
-		transcriber = voiceintake.NewWhisperServerTranscriber(transcriptionURL)
-	} else {
-		log.Printf("voice-intake: VOICE_INTAKE_TRANSCRIPTION_URL is empty; POST …/segments/{index}/audio will answer 503")
+	transcribers := voiceintake.Transcribers{}
+	for name, inferenceURL := range registry.StringMap(voiceintake.SettingTranscribers) {
+		transcribers[name] = voiceintake.NewWhisperServerTranscriber(inferenceURL)
 	}
-	server := voiceintake.NewServer(store, dispatcher, pool, registry, transcriber, time.Now)
+	var detector voiceintake.SpeechDetector
+	if detectionURL := registry.String(voiceintake.SettingSpeechDetectionURL); detectionURL != "" {
+		detector = voiceintake.NewSpeechServerDetector(detectionURL)
+	} else {
+		log.Printf("voice-intake: VOICE_INTAKE_SPEECH_DETECTION_URL is empty; streaming utterances will be refused with 503")
+	}
+	dispatcher.SetSpeechServices(detector, transcribers)
+	dispatcher.SetReplayRecordingDirectory(filepath.Join(dataDirectory, "replay-recordings"))
+	server := voiceintake.NewServer(store, dispatcher, pool, registry, transcribers, time.Now)
 
 	modelStoreURL := strings.TrimRight(registry.String(voiceintake.SettingModelStoreURL), "/")
 	server.SetSettingValidator(voiceintake.SettingContinuationJudgeModelRole, func(ctx context.Context, role string) error {
@@ -64,7 +70,7 @@ func main() {
 		}
 		return fmt.Errorf("model-store has no role %q; it has %s", role, strings.Join(answer.Roles, ", "))
 	})
-	server.SetSettingValidator(voiceintake.SettingDefaultModel, func(ctx context.Context, model string) error {
+	validateModel := func(ctx context.Context, model string) error {
 		var models []struct {
 			ID string `json:"id"`
 		}
@@ -77,8 +83,12 @@ func main() {
 			}
 		}
 		return fmt.Errorf("model-store has no model with id %q", model)
+	}
+	server.SetSettingValidator(voiceintake.SettingTranscriber, func(ctx context.Context, name string) error {
+		_, err := transcribers.Named(name)
+		return err
 	})
-	server.SetSettingValidator(voiceintake.SettingInstanceID, func(ctx context.Context, instanceID string) error {
+	validateInstance := func(ctx context.Context, instanceID string) error {
 		exists, err := bridge.InstanceExists(ctx, instanceID)
 		if err != nil {
 			return fmt.Errorf("%w: llm-bridge-server: %v", servicesettings.ErrSettingOwnerUnavailable, err)
@@ -87,7 +97,11 @@ func main() {
 			return fmt.Errorf("llm-bridge-server has no instance %q", instanceID)
 		}
 		return nil
-	})
+	}
+	server.SetSettingValidator(voiceintake.SettingDefaultModel, validateModel)
+	server.SetSettingValidator(voiceintake.SettingRaisedModel, validateModel)
+	server.SetSettingValidator(voiceintake.SettingInstanceID, validateInstance)
+	server.SetSettingValidator(voiceintake.SettingRaisedInstanceID, validateInstance)
 	registry.OnChange(func(key string) {
 		go pool.Resync(context.Background())
 	})

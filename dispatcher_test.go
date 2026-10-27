@@ -123,6 +123,10 @@ func (b *fakeBridge) InstanceExists(ctx context.Context, instanceID string) (boo
 	return true, nil
 }
 
+func (b *fakeBridge) InstanceOneshot(ctx context.Context, instanceID, model, systemPrompt, prompt string) (OneshotAnswer, error) {
+	return OneshotAnswer{Text: "oneshot answer to " + prompt, Model: model}, nil
+}
+
 func (b *fakeBridge) snapshot() (created []SessionCreation, ids []string, sent map[string][]string, stopped []string) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
@@ -157,13 +161,22 @@ type harness struct {
 	t      *testing.T
 	bridge *fakeBridge
 	judge  *fakeJudge
-	pool   *SessionPool
-	server *httptest.Server
+	pool     *SessionPool
+	server   *httptest.Server
+	detector *fakeDetector
 }
 
 func newHarness(t *testing.T, environment map[string]string) *harness {
 	t.Helper()
-	variables := map[string]string{"LLMBRIDGE_SERVICE_TOKEN": "test-token", "VOICE_INTAKE_INSTANCE_ID": "instance-for-tests", "VOICE_INTAKE_POOL_SIZE": "0"}
+	return newHarnessWithTranscribers(t, environment, nil)
+}
+
+// newHarnessWithTranscribers adds transcribers beside "fake", the fake
+// whisper-server.
+func newHarnessWithTranscribers(t *testing.T, environment map[string]string, extra Transcribers) *harness {
+	t.Helper()
+	variables := map[string]string{"LLMBRIDGE_SERVICE_TOKEN": "test-token", "VOICE_INTAKE_INSTANCE_ID": "instance-for-tests", "VOICE_INTAKE_POOL_SIZE": "0",
+		"VOICE_INTAKE_TRANSCRIBER": "fake"}
 	for key, value := range environment {
 		variables[key] = value
 	}
@@ -188,11 +201,18 @@ func newHarness(t *testing.T, environment map[string]string) *harness {
 	settings := func() DispatchSettings { return DispatchSettingsFrom(registry) }
 	pool := NewSessionPool(store, bridge, settings, time.Now)
 	dispatcher := NewDispatcher(store, bridge, judge, pool, settings, time.Now, directory+"/audio")
-	server := NewServer(store, dispatcher, pool, registry, transcriber, time.Now)
+	detector := newFakeDetector()
+	transcribers := Transcribers{"fake": transcriber}
+	for name, more := range extra {
+		transcribers[name] = more
+	}
+	dispatcher.SetSpeechServices(detector, transcribers)
+	dispatcher.SetReplayRecordingDirectory(directory + "/replay-recordings")
+	server := NewServer(store, dispatcher, pool, registry, transcribers, time.Now)
 	registry.OnChange(func(string) { pool.Resync(context.Background()) })
 	httpServer := httptest.NewServer(server.Handler())
 	t.Cleanup(httpServer.Close)
-	return &harness{t: t, bridge: bridge, judge: judge, pool: pool, server: httpServer}
+	return &harness{t: t, bridge: bridge, judge: judge, pool: pool, server: httpServer, detector: detector}
 }
 
 func (h *harness) call(method, path string, body any, principalID string) (int, map[string]any) {

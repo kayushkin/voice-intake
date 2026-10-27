@@ -41,6 +41,8 @@ type Dispatcher struct {
 	// when none are set.
 	detector     SpeechDetector
 	transcribers Transcribers
+	// replayRecordingDirectory holds the recordings replays read.
+	replayRecordingDirectory string
 
 	mutex sync.Mutex
 	runs  map[string]*utteranceRun
