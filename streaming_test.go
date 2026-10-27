@@ -327,6 +327,7 @@ func TestWordAccuracyReadsSpokenNumbersAsDigits(t *testing.T) {
 }
 
 func TestAReplayStreamsARecordingAndStopsItsSessionAfterTheTurn(t *testing.T) {
+	warmSessionSettleTime = 100 * time.Millisecond
 	h, _ := newStreamingHarness(t, nil, "testing one two three")
 	wav := pcmToWAV(pcmOf(audioPart{false, 200}, audioPart{true, 600}, audioPart{false, 800}))
 	request, _ := http.NewRequest("POST", h.server.URL+"/api/voice/replay-recordings?expected_text=Testing+123&true_speech_end_ms=800&true_speech_end_source=made+up",

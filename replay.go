@@ -454,29 +454,33 @@ func utteranceStopReason(d *Dispatcher, utterance Utterance) string {
 	return stored.StopRecordingReason
 }
 
-// warmSessionReadyLimit bounds the wait for a warm session to start.
-const warmSessionReadyLimit = time.Minute
+// warmSessionSettleTime is how long a warm session is given to start
+// before the replay begins. A claude_code session reads "starting" until its
+// first event, and it sends none until a message comes, so its state cannot
+// say it is ready; a pooled session has usually waited far longer than this.
+var warmSessionSettleTime = 15 * time.Second
 
-// startWarmSession starts a session before the replay and waits until the
-// bridge reports it past starting, as a pooled session would be.
+// startWarmSession starts a session before the replay and gives it time to
+// start, as a pooled session would have had.
 func (d *Dispatcher) startWarmSession(ctx context.Context, principalID string, configuration ReplayConfiguration) (string, error) {
 	sessionID, err := d.bridge.CreateSession(ctx, SessionCreation{PrincipalID: principalID, InstanceID: configuration.InstanceID, Effort: configuration.Effort,
 		Model: configuration.Model, WorkingDirectory: configuration.WorkingDirectory, DisplayName: "Voice replay: ready", MaxBudgetUSD: configuration.MaxBudgetUSD})
 	if err != nil {
 		return "", err
 	}
-	deadline := time.Now().Add(warmSessionReadyLimit)
-	for {
+	deadline := time.Now().Add(warmSessionSettleTime)
+	for time.Now().Before(deadline) {
 		state, err := d.bridge.SessionState(ctx, sessionID)
-		if err == nil && state != "starting" && state != "" {
-			return sessionID, nil
+		if err == nil && sessionStatesThatCannotTakeAMessage[state] {
+			d.stopAndArchive(sessionID, "it was "+state+" before the replay began")
+			return "", fmt.Errorf("session %s was %s before the replay began", sessionID, state)
 		}
-		if time.Now().After(deadline) {
-			d.stopAndArchive(sessionID, "it did not start in time")
-			return "", fmt.Errorf("session %s was still %q after %s (%v)", sessionID, state, warmSessionReadyLimit, err)
+		if err == nil && state != "starting" && state != "" {
+			break
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
+	return sessionID, nil
 }
 
 func (d *Dispatcher) releaseUnusedWarmSession(overrides *dispatchOverrides, sessionID string) {
