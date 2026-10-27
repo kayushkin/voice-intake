@@ -31,7 +31,8 @@ const (
 	SettingModelStoreURL           = "model_store_url"
 	SettingSessionWorkingDirectory = "session_working_directory"
 	SettingRaisedEffort            = "raised_effort"
-	SettingTranscriptionURL        = "transcription_url"
+	SettingTranscribers            = "transcribers"
+	SettingSpeechDetectionURL      = "speech_detection_url"
 )
 
 // Keys of the settings the phone and the operator read and change through
@@ -46,6 +47,11 @@ const (
 	SettingInstanceID                     = "instance_id"
 	SettingEndpointSilenceMilliseconds    = "endpoint_silence_ms"
 	SettingEagerSilenceMilliseconds       = "eager_silence_ms"
+	SettingTranscriber                    = "transcriber"
+	SettingNoSpeechTimeoutMilliseconds    = "no_speech_timeout_ms"
+	SettingMaximumRecordingMilliseconds   = "maximum_recording_ms"
+	SettingRaisedInstanceID               = "raised_instance_id"
+	SettingRaisedModel                    = "raised_model"
 )
 
 // DefaultListenAddress is where the service listens with nothing set.
@@ -79,8 +85,10 @@ func SettingDefinitions() []servicesettings.Definition {
 			Description: "Where model-store answers: a new continuation_judge_model_role is checked against its roles and a new default_model against its models."},
 		{Key: SettingSessionWorkingDirectory, EnvironmentVariable: "VOICE_INTAKE_SESSION_WORKING_DIR", Kind: path, ValueType: text,
 			Description: "The working directory of every voice session. The prompt a voice session reads is the project prompt collection rooted here. Empty leaves the instance's own directory."},
-		{Key: SettingTranscriptionURL, EnvironmentVariable: "VOICE_INTAKE_TRANSCRIPTION_URL", Kind: wiring, ValueType: text,
-			Description: "The inference route of a whisper.cpp whisper-server, for example http://127.0.0.1:<port>/inference. Segment audio posted to /segments/{index}/audio is transcribed there. Empty: that route answers 503."},
+		{Key: SettingTranscribers, EnvironmentVariable: "VOICE_INTAKE_TRANSCRIBERS", Kind: wiring, ValueType: msg.ServiceSettingValueTypeStringMap,
+			Description: "Transcription services by name, as name:url pairs separated by commas, each url the inference route of a whisper.cpp whisper-server or of speech-server (which also returns word times), for example parakeet:http://127.0.0.1:<port>/inference. The transcriber setting picks the one live speech uses; a replay configuration names its own."},
+		{Key: SettingSpeechDetectionURL, EnvironmentVariable: "VOICE_INTAKE_SPEECH_DETECTION_URL", Kind: wiring, ValueType: text,
+			Description: "Where speech-server answers, for example http://127.0.0.1:<port>: streamed audio is scored there by its Silero voice activity detector. Empty: streaming utterances are refused with 503."},
 		{Key: SettingRaisedEffort, EnvironmentVariable: "VOICE_INTAKE_RAISED_EFFORT", Kind: behaviour, ValueType: text, Default: "high",
 			Description: "The effort a session runs at when its text contains one of effort_raising_phrases."},
 
@@ -99,9 +107,19 @@ func SettingDefinitions() []servicesettings.Definition {
 		{Key: SettingInstanceID, EnvironmentVariable: "VOICE_INTAKE_INSTANCE_ID", Kind: behaviour, ValueType: text, Editable: true,
 			Description: "The llm-bridge-server instance voice sessions start on; its harness type is read from the bridge."},
 		{Key: SettingEndpointSilenceMilliseconds, EnvironmentVariable: "VOICE_INTAKE_ENDPOINT_SILENCE_MS", Kind: behaviour, ValueType: integer, Default: "900", Editable: true,
-			Description: "Read by the phone: the silence that ends a segment under the endpoint strategy."},
+			Description: "The silence that ends a segment under the endpoint strategy: read by the phone when it cuts segments itself, and used by this service's detector when the phone streams its audio."},
 		{Key: SettingEagerSilenceMilliseconds, EnvironmentVariable: "VOICE_INTAKE_EAGER_SILENCE_MS", Kind: behaviour, ValueType: integer, Default: "350", Editable: true,
-			Description: "Read by the phone: the silence that ends a segment under the eager strategy."},
+			Description: "The silence that ends a segment under the eager strategy, read by the phone or used by this service's detector as for endpoint_silence_ms."},
+		{Key: SettingTranscriber, EnvironmentVariable: "VOICE_INTAKE_TRANSCRIBER", Kind: behaviour, ValueType: text, Editable: true,
+			Description: "The name, in transcribers, of the transcription service live speech uses. Empty: audio is refused with 503."},
+		{Key: SettingNoSpeechTimeoutMilliseconds, EnvironmentVariable: "VOICE_INTAKE_NO_SPEECH_TIMEOUT_MS", Kind: behaviour, ValueType: integer, Default: "6000", Editable: true,
+			Description: "A streamed recording with no speech in this much audio is told to stop (stop_recording, reason no_speech)."},
+		{Key: SettingMaximumRecordingMilliseconds, EnvironmentVariable: "VOICE_INTAKE_MAXIMUM_RECORDING_MS", Kind: behaviour, ValueType: integer, Default: "300000", Editable: true,
+			Description: "A streamed recording is told to stop (stop_recording, reason max_duration) once this much audio has arrived."},
+		{Key: SettingRaisedInstanceID, EnvironmentVariable: "VOICE_INTAKE_RAISED_INSTANCE_ID", Kind: behaviour, ValueType: text, Editable: true,
+			Description: "The llm-bridge-server instance a long-mode utterance, or a text holding an effort-raising phrase, starts its session on. Empty: instance_id."},
+		{Key: SettingRaisedModel, EnvironmentVariable: "VOICE_INTAKE_RAISED_MODEL", Kind: behaviour, ValueType: text, Editable: true,
+			Description: "The model, by model-store id, of a long-mode utterance or a text holding an effort-raising phrase. Empty: default_model."},
 	}
 }
 
@@ -116,6 +134,8 @@ var voiceSettingKeys = []string{
 	SettingPoolSize, SettingContinuationWindowMilliseconds, SettingDefaultEffort, SettingDefaultModel,
 	SettingEffortRaisingPhrases, SettingContinuationJudgeModelRole, SettingInstanceID,
 	SettingEndpointSilenceMilliseconds, SettingEagerSilenceMilliseconds,
+	SettingTranscriber, SettingNoSpeechTimeoutMilliseconds, SettingMaximumRecordingMilliseconds,
+	SettingRaisedInstanceID, SettingRaisedModel,
 }
 
 func voiceSettingValueType(key string) msg.ServiceSettingValueType {
@@ -208,6 +228,32 @@ type DispatchSettings struct {
 	JudgeModelRole       string
 	InstanceID           string
 	WorkingDirectory     string
+	RaisedInstanceID     string
+	RaisedModel          string
+}
+
+// StreamSettings is what a streamed recording's detector reads, taken when
+// the utterance is made.
+type StreamSettings struct {
+	EndpointSilence    time.Duration
+	EagerSilence       time.Duration
+	NoSpeechTimeout    time.Duration
+	MaximumRecording   time.Duration
+	ContinuationWindow time.Duration
+	Transcriber        string
+}
+
+// StreamSettingsFrom reads StreamSettings from the registry.
+func StreamSettingsFrom(registry *servicesettings.Registry) StreamSettings {
+	milliseconds := func(key string) time.Duration { return time.Duration(registry.Integer(key)) * time.Millisecond }
+	return StreamSettings{
+		EndpointSilence:    milliseconds(SettingEndpointSilenceMilliseconds),
+		EagerSilence:       milliseconds(SettingEagerSilenceMilliseconds),
+		NoSpeechTimeout:    milliseconds(SettingNoSpeechTimeoutMilliseconds),
+		MaximumRecording:   milliseconds(SettingMaximumRecordingMilliseconds),
+		ContinuationWindow: milliseconds(SettingContinuationWindowMilliseconds),
+		Transcriber:        registry.String(SettingTranscriber),
+	}
 }
 
 // DispatchSettingsFrom reads DispatchSettings from the registry.
@@ -222,6 +268,8 @@ func DispatchSettingsFrom(registry *servicesettings.Registry) DispatchSettings {
 		JudgeModelRole:       registry.ModelRole(SettingContinuationJudgeModelRole),
 		InstanceID:           registry.String(SettingInstanceID),
 		WorkingDirectory:     registry.String(SettingSessionWorkingDirectory),
+		RaisedInstanceID:     registry.String(SettingRaisedInstanceID),
+		RaisedModel:          registry.String(SettingRaisedModel),
 	}
 }
 

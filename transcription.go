@@ -11,18 +11,54 @@ import (
 	"mime/multipart"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 )
 
 // SpeechTranscriber turns a segment's audio into text.
 type SpeechTranscriber interface {
 	// Transcribe returns the transcript exactly as the transcription service
-	// gave it. An empty transcript is not an error.
-	Transcribe(ctx context.Context, wav []byte) (string, error)
+	// gave it, with word times when the service gives them. An empty
+	// transcript is not an error.
+	Transcribe(ctx context.Context, wav []byte) (Transcript, error)
+}
+
+// Transcript is a transcription service's answer.
+type Transcript struct {
+	Text string
+	// Words is empty when the service gives no word times (whisper-server's
+	// json answer has none; speech-server's has them).
+	Words []TranscriptWord
+}
+
+// TranscriptWord is one word and where it lies in the audio sent.
+type TranscriptWord struct {
+	Word    string `json:"word"`
+	StartMs int64  `json:"start_ms"`
+	EndMs   int64  `json:"end_ms"`
+}
+
+// Transcribers are the transcription services by name, as
+// VOICE_INTAKE_TRANSCRIBERS lists them.
+type Transcribers map[string]SpeechTranscriber
+
+// Named returns the transcriber called name, or an error naming the ones
+// there are.
+func (transcribers Transcribers) Named(name string) (SpeechTranscriber, error) {
+	if transcriber, ok := transcribers[name]; ok && name != "" {
+		return transcriber, nil
+	}
+	names := make([]string, 0, len(transcribers))
+	for known := range transcribers {
+		names = append(names, known)
+	}
+	sort.Strings(names)
+	return nil, fmt.Errorf("no transcriber is named %q; %s (VOICE_INTAKE_TRANSCRIBERS) names: %s", name, SettingTranscribers, strings.Join(names, ", "))
 }
 
 // WhisperServerTranscriber calls a whisper.cpp whisper-server's inference
-// route: multipart field "file", JSON answer {"text": …}.
+// route, or speech-server's, which takes the same form: multipart field
+// "file", JSON answer {"text": …} and from speech-server also "words".
 type WhisperServerTranscriber struct {
 	inferenceURL string
 	client       *http.Client
@@ -37,55 +73,61 @@ func NewWhisperServerTranscriber(inferenceURL string) *WhisperServerTranscriber 
 // Transcribe sends the WAV at temperature 0. The audio context is left at
 // whisper's full 30 seconds: a context sized to a short clip was three times
 // faster when measured but repeated sentences and turned silence into words.
-func (t *WhisperServerTranscriber) Transcribe(ctx context.Context, wav []byte) (string, error) {
+func (t *WhisperServerTranscriber) Transcribe(ctx context.Context, wav []byte) (Transcript, error) {
+	text, words, err := t.transcribe(ctx, wav)
+	return Transcript{Text: text, Words: words}, err
+}
+
+func (t *WhisperServerTranscriber) transcribe(ctx context.Context, wav []byte) (string, []TranscriptWord, error) {
 	var body bytes.Buffer
 	form := multipart.NewWriter(&body)
 	file, err := form.CreateFormFile("file", "segment.wav")
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if _, err := file.Write(wav); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	for field, value := range map[string]string{"response_format": "json", "temperature": "0"} {
 		if err := form.WriteField(field, value); err != nil {
-			return "", err
+			return "", nil, err
 		}
 	}
 	if err := form.Close(); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, t.inferenceURL, &body)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	request.Header.Set("Content-Type", form.FormDataContentType())
 	response, err := t.client.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("transcription service: %w", err)
+		return "", nil, fmt.Errorf("transcription service: %w", err)
 	}
 	defer response.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("transcription service: read answer: %w", err)
+		return "", nil, fmt.Errorf("transcription service: read answer: %w", err)
 	}
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("transcription service answered %d: %s", response.StatusCode, strings.TrimSpace(string(raw)))
+		return "", nil, fmt.Errorf("transcription service answered %d: %s", response.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	var answer struct {
-		Text  *string `json:"text"`
-		Error string  `json:"error"`
+		Text  *string          `json:"text"`
+		Words []TranscriptWord `json:"words"`
+		Error string           `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &answer); err != nil {
-		return "", fmt.Errorf("transcription service: answer is not JSON: %v", err)
+		return "", nil, fmt.Errorf("transcription service: answer is not JSON: %v", err)
 	}
 	if answer.Error != "" {
-		return "", fmt.Errorf("transcription service: %s", answer.Error)
+		return "", nil, fmt.Errorf("transcription service: %s", answer.Error)
 	}
 	if answer.Text == nil {
-		return "", errors.New("transcription service: answer has no text field")
+		return "", nil, errors.New("transcription service: answer has no text field")
 	}
-	return *answer.Text, nil
+	return *answer.Text, answer.Words, nil
 }
 
 // nonSpeechMarker matches a transcript that is only a marker whisper writes

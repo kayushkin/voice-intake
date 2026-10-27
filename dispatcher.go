@@ -37,6 +37,10 @@ type Dispatcher struct {
 	settings       func() DispatchSettings
 	now            func() time.Time
 	audioDirectory string
+	// detector and transcribers serve streaming utterances; nil and empty
+	// when none are set.
+	detector     SpeechDetector
+	transcribers Transcribers
 
 	mutex sync.Mutex
 	runs  map[string]*utteranceRun
@@ -46,6 +50,35 @@ type Dispatcher struct {
 func NewDispatcher(store *Store, bridge SessionBridge, judge ContinuationJudge, pool *SessionPool, settings func() DispatchSettings, now func() time.Time, audioDirectory string) *Dispatcher {
 	return &Dispatcher{store: store, bridge: bridge, judge: judge, pool: pool, settings: settings, now: now, audioDirectory: audioDirectory,
 		runs: map[string]*utteranceRun{}}
+}
+
+// SetSpeechServices gives the dispatcher the detector and transcribers
+// streaming utterances use.
+func (d *Dispatcher) SetSpeechServices(detector SpeechDetector, transcribers Transcribers) {
+	d.detector = detector
+	d.transcribers = transcribers
+}
+
+// Dispatch modes of a replay configuration.
+const (
+	DispatchSession = "session"
+	DispatchOneshot = "oneshot"
+	DispatchNone    = "none"
+)
+
+// dispatchOverrides replace the settings for one utterance: a replay runs
+// under its configuration, not under what live speech uses.
+type dispatchOverrides struct {
+	replayID         string
+	mode             string
+	instanceID       string
+	model            string
+	effort           string
+	workingDirectory string
+	maxBudgetUSD     float64
+	// warmSessionID is a session started before the replay, taken by the
+	// first dispatch, as a pooled one would be.
+	warmSessionID string
 }
 
 // requestGroup is one request the utterance holds: the segments read as one
@@ -94,6 +127,9 @@ type utteranceRun struct {
 	cancelled   bool
 	windowTimer *time.Timer
 	audio       *utteranceAudio
+	mode        string
+	stream      *audioStream
+	overrides   *dispatchOverrides
 }
 
 // runFor returns the live run of an utterance, building it from the store
@@ -104,7 +140,7 @@ func (d *Dispatcher) runFor(utterance Utterance) (*utteranceRun, error) {
 	if run, ok := d.runs[utterance.UtteranceID]; ok {
 		return run, nil
 	}
-	run := &utteranceRun{dispatcher: d, utteranceID: utterance.UtteranceID, principalID: utterance.PrincipalID, hub: newEventHub(),
+	run := &utteranceRun{dispatcher: d, utteranceID: utterance.UtteranceID, principalID: utterance.PrincipalID, hub: newEventHub(), mode: utterance.Mode,
 		jobs: make(chan func(), 64), stopped: make(chan struct{}), segments: map[int]Segment{}, sessions: map[string]*runSession{}}
 	if err := run.loadFromStore(utterance); err != nil {
 		return nil, err
@@ -247,7 +283,16 @@ func (run *utteranceRun) processReadySegments() {
 		// window still runs from the last segment that had words.
 		spoken := hasWords(segment)
 		if spoken {
-			run.processSegment(segment)
+			run.mutex.Lock()
+			overrides := run.overrides
+			run.mutex.Unlock()
+			switch {
+			case overrides != nil && overrides.mode == DispatchNone:
+			case overrides != nil && overrides.mode == DispatchOneshot:
+				run.oneshot(overrides, segment)
+			default:
+				run.processSegment(segment)
+			}
 		}
 		run.mutex.Lock()
 		run.nextIndex = segment.Index + 1
@@ -426,28 +471,39 @@ func effortFor(text string, settings DispatchSettings) string {
 func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, text string) (*runSession, error) {
 	d := run.dispatcher
 	settings := d.settings()
-	effort := effortFor(text, settings)
 	started := d.now()
+	choice := run.sessionChoice(text, settings)
 
 	sessionID, pooledState, pooled := "", "", false
-	if effort == settings.DefaultEffort {
+	switch {
+	case choice.warmSessionID != "":
+		sessionID, pooled = choice.warmSessionID, true
+		state, err := d.bridge.SessionState(ctx, sessionID)
+		if err != nil {
+			state = "unknown: " + err.Error()
+		}
+		pooledState = state
+	case choice.usePool:
 		sessionID, pooledState, pooled = d.pool.Take(ctx, run.principalID, run.utteranceID, settings)
 	}
+	effort := choice.effort
 	if !pooled {
-		created, err := d.bridge.CreateSession(ctx, SessionCreation{PrincipalID: run.principalID, InstanceID: settings.InstanceID, Effort: effort,
-			Model: settings.DefaultModel, WorkingDirectory: settings.WorkingDirectory, DisplayName: text})
+		created, err := d.bridge.CreateSession(ctx, SessionCreation{PrincipalID: run.principalID, InstanceID: choice.instanceID, Effort: effort,
+			Model: choice.model, WorkingDirectory: choice.workingDirectory, DisplayName: text, MaxBudgetUSD: choice.maxBudgetUSD})
 		if err != nil {
 			run.recordError(fmt.Sprintf("segments %v: start a session: %v", segmentIndexes, err))
 			return nil, err
 		}
 		sessionID = created
 	}
-	defer d.pool.Fill(run.principalID)
+	if choice.usePool {
+		defer d.pool.Fill(run.principalID)
+	}
 
 	session := &runSession{sessionID: sessionID, segmentIndexes: segmentIndexes, text: text, role: RoleSpeculative}
 	record := UtteranceSession{SessionID: sessionID, UtteranceID: run.utteranceID, SegmentIndexes: segmentIndexes, Text: text, Role: RoleSpeculative,
-		Pooled: pooled, PooledSessionState: pooledState, Effort: effort, Model: settings.DefaultModel, InstanceID: settings.InstanceID,
-		DispatchStartedAtMs: started.UnixMilli()}
+		Pooled: pooled, PooledSessionState: pooledState, Effort: effort, Model: choice.model, InstanceID: choice.instanceID,
+		WorkingDirectory: choice.workingDirectory, DispatchStartedAtMs: started.UnixMilli()}
 	if err := d.store.InsertUtteranceSession(record); err != nil {
 		log.Printf("[dispatch] ERROR %s: record session %s: %v", run.utteranceID, sessionID, err)
 	}
@@ -505,6 +561,45 @@ func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, tex
 	return session, nil
 }
 
+// sessionChoice is where and how one text's session runs.
+type sessionChoice struct {
+	instanceID       string
+	model            string
+	effort           string
+	workingDirectory string
+	maxBudgetUSD     float64
+	usePool          bool
+	warmSessionID    string
+}
+
+// sessionChoice reads it: a replay's configuration; else the raised
+// instance, model and effort for long mode or an effort-raising phrase; else
+// the defaults, from the pool when one is ready.
+func (run *utteranceRun) sessionChoice(text string, settings DispatchSettings) sessionChoice {
+	run.mutex.Lock()
+	defer run.mutex.Unlock()
+	if o := run.overrides; o != nil {
+		choice := sessionChoice{instanceID: o.instanceID, model: o.model, effort: o.effort, workingDirectory: o.workingDirectory,
+			maxBudgetUSD: o.maxBudgetUSD, warmSessionID: o.warmSessionID}
+		o.warmSessionID = ""
+		return choice
+	}
+	choice := sessionChoice{instanceID: settings.InstanceID, model: settings.DefaultModel, effort: effortFor(text, settings),
+		workingDirectory: settings.WorkingDirectory}
+	if run.mode == "long" || choice.effort != settings.DefaultEffort {
+		choice.effort = settings.RaisedEffort
+		if settings.RaisedInstanceID != "" {
+			choice.instanceID = settings.RaisedInstanceID
+		}
+		if settings.RaisedModel != "" {
+			choice.model = settings.RaisedModel
+		}
+		return choice
+	}
+	choice.usePool = true
+	return choice
+}
+
 // streamSession reads one session's events until its result: it records the
 // first block and the result, and passes every event on unless the session
 // was superseded.
@@ -522,6 +617,10 @@ func (run *utteranceRun) streamSession(ctx context.Context, session *runSession,
 			}
 		case msg.EventResult:
 			if err := d.store.SetSessionResult(session.sessionID, at); err != nil {
+				log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
+			}
+			text, cost := resultReply(event.Data)
+			if err := d.store.SetSessionReply(session.sessionID, text, cost); err != nil {
 				log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
 			}
 		}
@@ -543,7 +642,13 @@ func (run *utteranceRun) streamSession(ctx context.Context, session *runSession,
 	run.mutex.Lock()
 	stopped := session.stopped
 	session.turnFinished = true
+	replay := run.overrides != nil
 	run.mutex.Unlock()
+	if replay && !stopped {
+		// A replay's sessions are measurements: each is stopped and archived
+		// once its turn is over.
+		defer run.stopSession(session, "the replay's turn finished")
+	}
 	if !sawResult && !stopped {
 		problem := "its event stream ended before a result"
 		if err != nil {
@@ -555,6 +660,27 @@ func (run *utteranceRun) streamSession(ctx context.Context, session *runSession,
 		}
 	}
 	run.checkDone()
+}
+
+// resultReply reads the reply text and the turn's cost from a result event
+// as llm-bridge-server streams it: the event, with the result under "result".
+func resultReply(data json.RawMessage) (string, *float64) {
+	var event struct {
+		Result *struct {
+			Text string `json:"text"`
+			Cost *struct {
+				TotalUSD float64 `json:"total_usd"`
+			} `json:"cost"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil || event.Result == nil {
+		return "", nil
+	}
+	if event.Result.Cost == nil {
+		return event.Result.Text, nil
+	}
+	cost := event.Result.Cost.TotalUSD
+	return event.Result.Text, &cost
 }
 
 func turnEndingStatus(data json.RawMessage) bool {
@@ -696,6 +822,9 @@ func (run *utteranceRun) cancel() {
 	if run.windowTimer != nil {
 		run.windowTimer.Stop()
 	}
+	if run.stream != nil {
+		go run.stream.cancel()
+	}
 	var sessions []*runSession
 	for _, sessionID := range run.order {
 		sessions = append(sessions, run.sessions[sessionID])
@@ -730,6 +859,31 @@ func (run *utteranceRun) checkDone() {
 	}
 	run.hub.publish(eventDone, map[string]any{})
 	run.stopOnce.Do(func() { close(run.stopped) })
+}
+
+// done is closed once the utterance has sent done.
+func (run *utteranceRun) done() <-chan struct{} { return run.stopped }
+
+// oneshotSystemPrompt is what a oneshot replay sends: the floor of what a
+// voice answer costs, with no tools and no session.
+const oneshotSystemPrompt = "You answer a spoken request; your reply is read aloud. Answer in one or two short plain sentences."
+
+// oneshot answers a segment with one model call and records it on the
+// replay.
+func (run *utteranceRun) oneshot(overrides *dispatchOverrides, segment Segment) {
+	d := run.dispatcher
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	started := d.now().UnixMilli()
+	answer, err := d.bridge.InstanceOneshot(ctx, overrides.instanceID, overrides.model, oneshotSystemPrompt, segment.Text)
+	answered := d.now().UnixMilli()
+	if err != nil {
+		run.recordError(fmt.Sprintf("segment %d: oneshot on %s: %v", segment.Index, overrides.instanceID, err))
+		return
+	}
+	if err := d.store.SetReplayOneshot(overrides.replayID, started, answered, answer.Model, answer.Text); err != nil {
+		log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
+	}
 }
 
 func (run *utteranceRun) recordError(message string) {

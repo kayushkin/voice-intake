@@ -24,6 +24,18 @@ CREATE TABLE IF NOT EXISTS utterances (
     audio_size_bytes             INTEGER NOT NULL DEFAULT 0,
     audio_received_at_ms         INTEGER,
     errors                       TEXT NOT NULL DEFAULT '[]',
+    -- Streaming (contract v2): the phone streams PCM and this service ends
+    -- the segments. Audio byte 0 is speech_started_at_ms.
+    audio_streaming              INTEGER NOT NULL DEFAULT 0,
+    audio_format                 TEXT NOT NULL DEFAULT '',
+    stream_received_bytes        INTEGER NOT NULL DEFAULT 0,
+    stop_recording_reason        TEXT NOT NULL DEFAULT '',
+    stop_recording_sent_at_ms    INTEGER,
+    stopped_at_client_ms         INTEGER,
+    stopped_at_ms                INTEGER,
+    stop_reason                  TEXT NOT NULL DEFAULT '',
+    -- Set when the utterance is a replay of a stored recording or text.
+    replay_id                    TEXT NOT NULL DEFAULT '',
     UNIQUE (principal_id, client_utterance_id)
 );
 
@@ -43,6 +55,12 @@ CREATE TABLE IF NOT EXISTS segments (
     transcription_started_at_ms  INTEGER,
     transcribed_at_ms            INTEGER,
     transcript_raw               TEXT NOT NULL DEFAULT '',
+    -- 'stream' segments: where the detector heard the speech, as offsets
+    -- into the streamed audio, and when it decided the speech had ended.
+    detected_speech_start_offset_ms INTEGER,
+    detected_speech_end_offset_ms   INTEGER,
+    endpointed_at_ms             INTEGER,
+    transcriber                  TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (utterance_id, segment_index)
 );
 
@@ -64,7 +82,10 @@ CREATE TABLE IF NOT EXISTS utterance_sessions (
     result_at_ms                 INTEGER,
     stopped_at_ms                INTEGER,
     stop_reason                  TEXT NOT NULL DEFAULT '',
-    error                        TEXT NOT NULL DEFAULT ''
+    error                        TEXT NOT NULL DEFAULT '',
+    working_directory            TEXT NOT NULL DEFAULT '',
+    reply_text                   TEXT NOT NULL DEFAULT '',
+    turn_cost_usd                REAL
 );
 CREATE INDEX IF NOT EXISTS utterance_sessions_by_utterance ON utterance_sessions(utterance_id);
 
@@ -113,4 +134,56 @@ CREATE TABLE IF NOT EXISTS pooled_sessions (
 CREATE TABLE IF NOT EXISTS stored_settings (
     key                          TEXT PRIMARY KEY,
     value                        TEXT NOT NULL
+);
+
+-- Recordings kept for replay, with the known words and the true end of
+-- speech, which endpoint delay is measured against.
+CREATE TABLE IF NOT EXISTS replay_recordings (
+    sequence                     INTEGER PRIMARY KEY,
+    recording_id                 TEXT NOT NULL UNIQUE,
+    filename                     TEXT NOT NULL,
+    expected_text                TEXT NOT NULL,
+    duration_ms                  INTEGER NOT NULL,
+    true_speech_end_ms           INTEGER NOT NULL,
+    true_speech_end_source       TEXT NOT NULL,
+    words                        TEXT NOT NULL DEFAULT '[]',
+    created_at_ms                INTEGER NOT NULL
+);
+
+-- A named way to run a replay: detector, transcriber, and where the text
+-- goes.
+CREATE TABLE IF NOT EXISTS replay_configurations (
+    sequence                     INTEGER PRIMARY KEY,
+    configuration_id             TEXT NOT NULL UNIQUE,
+    name                         TEXT NOT NULL,
+    detector                     TEXT NOT NULL,
+    endpoint_silence_ms          INTEGER NOT NULL,
+    transcriber                  TEXT NOT NULL,
+    dispatch                     TEXT NOT NULL,
+    instance_id                  TEXT NOT NULL DEFAULT '',
+    model                        TEXT NOT NULL DEFAULT '',
+    effort                       TEXT NOT NULL DEFAULT '',
+    working_directory            TEXT NOT NULL DEFAULT '',
+    prompt_variant               TEXT NOT NULL DEFAULT '',
+    warm_session                 INTEGER NOT NULL DEFAULT 0,
+    max_budget_usd               REAL NOT NULL DEFAULT 0,
+    created_at_ms                INTEGER NOT NULL
+);
+
+-- One replay: a recording or a text run once under a configuration.
+CREATE TABLE IF NOT EXISTS replays (
+    sequence                     INTEGER PRIMARY KEY,
+    replay_id                    TEXT NOT NULL UNIQUE,
+    configuration_id             TEXT NOT NULL REFERENCES replay_configurations(configuration_id),
+    recording_id                 TEXT NOT NULL DEFAULT '',
+    text                         TEXT NOT NULL DEFAULT '',
+    utterance_id                 TEXT NOT NULL DEFAULT '',
+    started_at_ms                INTEGER NOT NULL,
+    finished_at_ms               INTEGER,
+    -- dispatch 'oneshot': one model call with no session.
+    oneshot_started_at_ms        INTEGER,
+    oneshot_answered_at_ms       INTEGER,
+    oneshot_model                TEXT NOT NULL DEFAULT '',
+    oneshot_text                 TEXT NOT NULL DEFAULT '',
+    error                        TEXT NOT NULL DEFAULT ''
 );

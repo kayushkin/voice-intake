@@ -40,17 +40,17 @@ type Server struct {
 	pool       *SessionPool
 	registry   *servicesettings.Registry
 	now        func() time.Time
-	// transcriber is nil when no transcription service is set, and then the
-	// segment audio route answers 503.
-	transcriber SpeechTranscriber
+	// transcribers are the transcription services by name; the transcriber
+	// setting picks the one live audio uses.
+	transcribers Transcribers
 	// settingValidators check a new value with the service that owns what
 	// it names.
 	settingValidators map[string]func(ctx context.Context, value string) error
 }
 
 // NewServer builds the API.
-func NewServer(store *Store, dispatcher *Dispatcher, pool *SessionPool, registry *servicesettings.Registry, transcriber SpeechTranscriber, now func() time.Time) *Server {
-	return &Server{store: store, dispatcher: dispatcher, pool: pool, registry: registry, transcriber: transcriber, now: now,
+func NewServer(store *Store, dispatcher *Dispatcher, pool *SessionPool, registry *servicesettings.Registry, transcribers Transcribers, now func() time.Time) *Server {
+	return &Server{store: store, dispatcher: dispatcher, pool: pool, registry: registry, transcribers: transcribers, now: now,
 		settingValidators: map[string]func(ctx context.Context, value string) error{}}
 }
 
@@ -74,6 +74,15 @@ func (s *Server) Handler() http.Handler {
 	voice.HandleFunc("GET /api/voice/settings", s.getVoiceSettings)
 	voice.HandleFunc("PATCH /api/voice/settings", s.patchVoiceSettings)
 	voice.HandleFunc("GET /api/voice/latency", s.getLatency)
+	voice.HandleFunc("POST /api/voice/utterances/{id}/audio-stream", s.postAudioStream)
+	voice.HandleFunc("POST /api/voice/utterances/{id}/stop", s.stopUtterance)
+	voice.HandleFunc("POST /api/voice/replay-recordings", s.createReplayRecording)
+	voice.HandleFunc("GET /api/voice/replay-recordings", s.listReplayRecordings)
+	voice.HandleFunc("POST /api/voice/replay-configurations", s.createReplayConfiguration)
+	voice.HandleFunc("GET /api/voice/replay-configurations", s.listReplayConfigurations)
+	voice.HandleFunc("POST /api/voice/replays", s.createReplay)
+	voice.HandleFunc("GET /api/voice/replays", s.listReplays)
+	voice.HandleFunc("GET /api/voice/replays/{replay_id}", s.getReplay)
 	mux.Handle("/api/voice/", requirePrincipalFromLoopback(voice))
 	return mux
 }
@@ -145,6 +154,8 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 		Strategy          string `json:"strategy"`
 		Trigger           string `json:"trigger"`
 		SpeechStartedAtMs *int64 `json:"speech_started_at_ms"`
+		AudioStreaming    bool   `json:"audio_streaming"`
+		AudioFormat       string `json:"audio_format"`
 	}
 	if err := decodeStrict(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -166,6 +177,12 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 	if body.SpeechStartedAtMs == nil {
 		problems = append(problems, "speech_started_at_ms is required")
 	}
+	if body.AudioStreaming && body.AudioFormat != StreamAudioFormat {
+		problems = append(problems, fmt.Sprintf("audio_format %q: a streaming utterance sends %q", body.AudioFormat, StreamAudioFormat))
+	}
+	if !body.AudioStreaming && body.AudioFormat != "" {
+		problems = append(problems, "audio_format is for a streaming utterance; audio_streaming is not true")
+	}
 	skew, err := s.clientClockSkewMs(r, receivedAtMs)
 	if err != nil {
 		problems = append(problems, err.Error())
@@ -174,9 +191,16 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, strings.Join(problems, "; "))
 		return
 	}
+	if body.AudioStreaming {
+		if err := s.dispatcher.streamingAvailable(StreamSettingsFrom(s.registry).Transcriber); err != nil {
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+	}
 	utterance, created, err := s.store.CreateUtterance(Utterance{
 		ClientUtteranceID: body.ClientUtteranceID, PrincipalID: principalOf(r), Mode: body.Mode, Strategy: body.Strategy, Trigger: body.Trigger,
 		SpeechStartedAtClientMs: *body.SpeechStartedAtMs, SpeechStartedAtMs: *body.SpeechStartedAtMs + skew, ClientClockSkewMs: skew, ReceivedAtMs: receivedAtMs,
+		AudioStreaming: body.AudioStreaming, AudioFormat: body.AudioFormat,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -188,6 +212,12 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 		if err := s.dispatcher.Start(utterance); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
+		}
+		if utterance.AudioStreaming {
+			if err := s.dispatcher.StartStream(utterance, StreamOptionsFor(utterance, StreamSettingsFrom(s.registry))); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
 		}
 	}
 	writeJSON(w, status, map[string]string{"utterance_id": utterance.UtteranceID})
@@ -356,14 +386,17 @@ func (s *Server) postSegmentAudio(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if s.transcriber == nil {
-		writeError(w, http.StatusServiceUnavailable, "no transcription service is set: "+SettingTranscriptionURL+" (VOICE_INTAKE_TRANSCRIPTION_URL) is empty")
+	transcriberName := s.registry.String(SettingTranscriber)
+	transcriber, err := s.transcribers.Named(transcriberName)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "no transcription service: "+err.Error())
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), segmentTranscriptionLimit)
 	defer cancel()
 	transcriptionStartedAtMs := s.now().UnixMilli()
-	rawTranscript, err := s.transcriber.Transcribe(ctx, wav)
+	transcript, err := transcriber.Transcribe(ctx, wav)
+	rawTranscript := transcript.Text
 	transcribedAtMs := s.now().UnixMilli()
 	if err != nil {
 		message := fmt.Sprintf("segment %d: transcription failed after %d ms: %v", index, transcribedAtMs-transcriptionStartedAtMs, err)
@@ -377,7 +410,7 @@ func (s *Server) postSegmentAudio(w http.ResponseWriter, r *http.Request) {
 	segment := Segment{UtteranceID: utterance.UtteranceID, Index: index, Text: spokenText(rawTranscript), SpeechEndedAtClientMs: speechEndedAtClientMs,
 		SpeechEndedAtMs: speechEndedAtClientMs + skew, ClientClockSkewMs: skew, ReceivedAtMs: receivedAtMs, Source: SegmentSourceAudio,
 		AudioSizeBytes: &sizeBytes, AudioDurationMs: &durationMs, TranscriptionStartedAtMs: &transcriptionStartedAtMs, TranscribedAtMs: &transcribedAtMs,
-		TranscriptRaw: rawTranscript}
+		TranscriptRaw: rawTranscript, Transcriber: transcriberName}
 	inserted, err := s.store.InsertSegment(segment)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -434,6 +467,93 @@ func (s *Server) finishUtterance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"utterance_id": utterance.UtteranceID, "status": "finished"})
+}
+
+// maximumStreamChunkBytes bounds one audio-stream request: 60 s of audio.
+const maximumStreamChunkBytes = 60 * 1000 * streamBytesPerMillisecond
+
+// postAudioStream takes the next raw PCM bytes of a streaming utterance at
+// offset_bytes (contract v2).
+func (s *Server) postAudioStream(w http.ResponseWriter, r *http.Request) {
+	utterance, ok := s.ownedUtterance(w, r)
+	if !ok {
+		return
+	}
+	if !utterance.AudioStreaming {
+		writeError(w, http.StatusConflict, utterance.UtteranceID+" was not made with audio_streaming true")
+		return
+	}
+	if utterance.CancelledAtMs != nil {
+		writeError(w, http.StatusConflict, utterance.UtteranceID+" was cancelled")
+		return
+	}
+	offset, err := strconv.ParseInt(r.URL.Query().Get("offset_bytes"), 10, 64)
+	if err != nil || offset < 0 || offset%2 != 0 {
+		writeError(w, http.StatusBadRequest, "offset_bytes is required: the even byte offset of the chunk in the stream")
+		return
+	}
+	chunk, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maximumStreamChunkBytes))
+	if err != nil {
+		writeError(w, http.StatusRequestEntityTooLarge, err.Error())
+		return
+	}
+	if len(chunk)%2 != 0 {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("the chunk is %d bytes, not a whole number of 16-bit samples", len(chunk)))
+		return
+	}
+	total, err := s.dispatcher.AppendStreamAudio(r.Context(), utterance, offset, chunk)
+	var ahead StreamOffsetAheadError
+	switch {
+	case errors.As(err, &ahead):
+		writeJSON(w, http.StatusConflict, map[string]any{"expected_offset_bytes": ahead.ExpectedOffsetBytes})
+	case errors.Is(err, ErrStreamStopped):
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "received_bytes": total})
+	case err != nil && total == 0:
+		writeError(w, http.StatusInternalServerError, err.Error())
+	case err != nil:
+		// The bytes are kept; the detector could not score them.
+		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error(), "received_bytes": total})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"received_bytes": total})
+	}
+}
+
+// stopUtterance records that the phone stopped the microphone (contract v2).
+func (s *Server) stopUtterance(w http.ResponseWriter, r *http.Request) {
+	receivedAtMs := s.now().UnixMilli()
+	utterance, ok := s.ownedUtterance(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		EndedAtMs *int64 `json:"ended_at_ms"`
+		Reason    string `json:"reason"`
+	}
+	if err := decodeStrict(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	skew, err := s.clientClockSkewMs(r, receivedAtMs)
+	switch {
+	case err != nil:
+	case body.EndedAtMs == nil:
+		err = errors.New("ended_at_ms is required")
+	case !stopReasons[body.Reason]:
+		err = fmt.Errorf("reason %q is not one of %s", body.Reason, sortedKeys(stopReasons))
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !utterance.AudioStreaming {
+		writeError(w, http.StatusConflict, utterance.UtteranceID+" was not made with audio_streaming true; it ends with finish")
+		return
+	}
+	if err := s.dispatcher.StopStream(utterance, *body.EndedAtMs, *body.EndedAtMs+skew, body.Reason); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"utterance_id": utterance.UtteranceID, "status": "stopped"})
 }
 
 func (s *Server) cancelUtterance(w http.ResponseWriter, r *http.Request) {
@@ -601,8 +721,17 @@ func (s *Server) validateSetting(ctx context.Context, key, value string) error {
 
 func (s *Server) getLatency(w http.ResponseWriter, r *http.Request) {
 	groupBy := r.URL.Query().Get("group_by")
+	if groupBy == "configuration" {
+		groups, err := s.store.ReplayLatencyGroups()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"group_by": groupBy, "groups": groups})
+		return
+	}
 	if !latencyGroupings[groupBy] {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("group_by must be one of %s", sortedKeys(latencyGroupings)))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("group_by must be configuration or one of %s", sortedKeys(latencyGroupings)))
 		return
 	}
 	samples, err := s.store.LatencySamples()

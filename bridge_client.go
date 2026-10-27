@@ -24,6 +24,8 @@ type SessionCreation struct {
 	Model            string
 	WorkingDirectory string
 	DisplayName      string
+	// MaxBudgetUSD is the session's spend ceiling; zero sets none.
+	MaxBudgetUSD float64
 }
 
 // BridgeEvent is one llm-bridge-server event, passed on unchanged.
@@ -46,6 +48,14 @@ type SessionBridge interface {
 	StreamSessionEvents(ctx context.Context, sessionID string, connected func(), deliver func(BridgeEvent) bool) error
 	ShareFile(ctx context.Context, sessionID, filename, contentType string, content []byte) error
 	InstanceExists(ctx context.Context, instanceID string) (bool, error)
+	// InstanceOneshot is one model call on an instance with no session.
+	InstanceOneshot(ctx context.Context, instanceID, model, systemPrompt, prompt string) (OneshotAnswer, error)
+}
+
+// OneshotAnswer is the bridge's answer to a oneshot call.
+type OneshotAnswer struct {
+	Text  string `json:"text"`
+	Model string `json:"model"`
 }
 
 // HTTPSessionBridge calls llm-bridge-server as the internal service.
@@ -207,6 +217,10 @@ func (b *HTTPSessionBridge) CreateSession(ctx context.Context, creation SessionC
 		HarnessConfig: encodedConfig,
 		WorkingDir:    creation.WorkingDirectory,
 	}
+	if creation.MaxBudgetUSD > 0 {
+		budget := creation.MaxBudgetUSD
+		request.MaxBudget = &budget
+	}
 	var answer struct {
 		SessionID string `json:"session_id"`
 	}
@@ -217,6 +231,14 @@ func (b *HTTPSessionBridge) CreateSession(ctx context.Context, creation SessionC
 		return "", fmt.Errorf("llm-bridge-server POST /sessions answered with no session_id")
 	}
 	return answer.SessionID, nil
+}
+
+// InstanceOneshot calls POST /instances/{id}/oneshot, which takes a model.
+func (b *HTTPSessionBridge) InstanceOneshot(ctx context.Context, instanceID, model, systemPrompt, prompt string) (OneshotAnswer, error) {
+	var answer OneshotAnswer
+	request := msg.OneShotRequest{Prompt: prompt, SystemPrompt: systemPrompt, Model: model, Caller: "voice-intake-replay"}
+	err := b.do(ctx, http.MethodPost, "/instances/"+url.PathEscape(instanceID)+"/oneshot", "", request, &answer)
+	return answer, err
 }
 
 // SendMessage sends text into a session as the person's message.

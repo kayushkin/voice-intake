@@ -19,6 +19,10 @@ const (
 	eventSessionEvent = "session_event"
 	eventDone         = "done"
 	eventError        = "error"
+	// Contract v2, for streaming utterances.
+	eventHearing       = "hearing"
+	eventTranscript    = "transcript"
+	eventStopRecording = "stop_recording"
 )
 
 // eventHub keeps every event of one utterance, so a subscriber that connects

@@ -65,6 +65,22 @@ var columnsAddedAfterTheFirstSchema = []struct{ table, column, definition string
 	{"segments", "transcription_started_at_ms", "INTEGER"},
 	{"segments", "transcribed_at_ms", "INTEGER"},
 	{"segments", "transcript_raw", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "audio_streaming", "INTEGER NOT NULL DEFAULT 0"},
+	{"utterances", "audio_format", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "stream_received_bytes", "INTEGER NOT NULL DEFAULT 0"},
+	{"utterances", "stop_recording_reason", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "stop_recording_sent_at_ms", "INTEGER"},
+	{"utterances", "stopped_at_client_ms", "INTEGER"},
+	{"utterances", "stopped_at_ms", "INTEGER"},
+	{"utterances", "stop_reason", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "replay_id", "TEXT NOT NULL DEFAULT ''"},
+	{"segments", "detected_speech_start_offset_ms", "INTEGER"},
+	{"segments", "detected_speech_end_offset_ms", "INTEGER"},
+	{"segments", "endpointed_at_ms", "INTEGER"},
+	{"segments", "transcriber", "TEXT NOT NULL DEFAULT ''"},
+	{"utterance_sessions", "working_directory", "TEXT NOT NULL DEFAULT ''"},
+	{"utterance_sessions", "reply_text", "TEXT NOT NULL DEFAULT ''"},
+	{"utterance_sessions", "turn_cost_usd", "REAL"},
 }
 
 func addMissingColumns(db *sql.DB) error {
@@ -139,6 +155,15 @@ type Utterance struct {
 	AudioSizeBytes          int64    `json:"audio_size_bytes"`
 	AudioReceivedAtMs       *int64   `json:"audio_received_at_ms"`
 	Errors                  []string `json:"errors"`
+	AudioStreaming          bool     `json:"audio_streaming"`
+	AudioFormat             string   `json:"audio_format"`
+	StreamReceivedBytes     int64    `json:"stream_received_bytes"`
+	StopRecordingReason     string   `json:"stop_recording_reason"`
+	StopRecordingSentAtMs   *int64   `json:"stop_recording_sent_at_ms"`
+	StoppedAtClientMs       *int64   `json:"stopped_at_client_ms"`
+	StoppedAtMs             *int64   `json:"stopped_at_ms"`
+	StopReason              string   `json:"stop_reason"`
+	ReplayID                string   `json:"replay_id"`
 }
 
 // Segment is speech between two pauses.
@@ -162,12 +187,22 @@ type Segment struct {
 	TranscribedAtMs          *int64 `json:"transcribed_at_ms,omitempty"`
 	TranscriptionMs          *int64 `json:"transcription_ms,omitempty"`
 	TranscriptRaw            string `json:"transcript_raw,omitempty"`
+	// For SegmentSourceStream: where the detector heard the speech, as
+	// offsets into the streamed audio, when it ended the segment, and the
+	// transcriber used.
+	DetectedSpeechStartOffsetMs *int64 `json:"detected_speech_start_offset_ms,omitempty"`
+	DetectedSpeechEndOffsetMs   *int64 `json:"detected_speech_end_offset_ms,omitempty"`
+	EndpointedAtMs              *int64 `json:"endpointed_at_ms,omitempty"`
+	Transcriber                 string `json:"transcriber,omitempty"`
 }
 
 // Where a segment's text came from.
 const (
 	SegmentSourceText  = "text"
 	SegmentSourceAudio = "audio"
+	// SegmentSourceStream is a segment this service cut from streamed audio
+	// with its own detector, and transcribed.
+	SegmentSourceStream = "stream"
 )
 
 // Session roles. A session starts speculative; a decision makes it kept,
@@ -198,6 +233,9 @@ type UtteranceSession struct {
 	StoppedAtMs         *int64 `json:"stopped_at_ms"`
 	StopReason          string `json:"stop_reason"`
 	Error               string `json:"error"`
+	WorkingDirectory    string   `json:"working_directory"`
+	ReplyText           string   `json:"reply_text"`
+	TurnCostUSD         *float64 `json:"turn_cost_usd"`
 }
 
 // Decision is one role a session was given, and why.
@@ -225,7 +263,9 @@ type ContinuationJudgment struct {
 const utteranceColumns = `utterance_id, client_utterance_id, principal_id, mode, strategy, trigger,
 	speech_started_at_client_ms, speech_started_at_ms, client_clock_skew_ms, received_at_ms,
 	ended_at_client_ms, ended_at_ms, finished_at_ms, finalized_at_ms, cancelled_at_ms,
-	audio_filename, audio_content_type, audio_size_bytes, audio_received_at_ms, errors`
+	audio_filename, audio_content_type, audio_size_bytes, audio_received_at_ms, errors,
+	audio_streaming, audio_format, stream_received_bytes, stop_recording_reason, stop_recording_sent_at_ms,
+	stopped_at_client_ms, stopped_at_ms, stop_reason, replay_id`
 
 type rowScanner interface {
 	Scan(destination ...any) error
@@ -238,7 +278,9 @@ func scanUtterance(row rowScanner) (Utterance, error) {
 		&utterance.Mode, &utterance.Strategy, &utterance.Trigger,
 		&utterance.SpeechStartedAtClientMs, &utterance.SpeechStartedAtMs, &utterance.ClientClockSkewMs, &utterance.ReceivedAtMs,
 		&utterance.EndedAtClientMs, &utterance.EndedAtMs, &utterance.FinishedAtMs, &utterance.FinalizedAtMs, &utterance.CancelledAtMs,
-		&utterance.AudioFilename, &utterance.AudioContentType, &utterance.AudioSizeBytes, &utterance.AudioReceivedAtMs, &errorsJSON)
+		&utterance.AudioFilename, &utterance.AudioContentType, &utterance.AudioSizeBytes, &utterance.AudioReceivedAtMs, &errorsJSON,
+		&utterance.AudioStreaming, &utterance.AudioFormat, &utterance.StreamReceivedBytes, &utterance.StopRecordingReason, &utterance.StopRecordingSentAtMs,
+		&utterance.StoppedAtClientMs, &utterance.StoppedAtMs, &utterance.StopReason, &utterance.ReplayID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Utterance{}, ErrNotFound
 	}
@@ -274,9 +316,10 @@ func (s *Store) CreateUtterance(utterance Utterance) (Utterance, bool, error) {
 	utterance.UtteranceID = fmt.Sprintf("utterance_%06d", next)
 	utterance.Errors = []string{}
 	_, err = transaction.Exec(`INSERT INTO utterances (sequence, utterance_id, client_utterance_id, principal_id, mode, strategy, trigger,
-		speech_started_at_client_ms, speech_started_at_ms, client_clock_skew_ms, received_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		speech_started_at_client_ms, speech_started_at_ms, client_clock_skew_ms, received_at_ms, audio_streaming, audio_format, replay_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		next, utterance.UtteranceID, utterance.ClientUtteranceID, utterance.PrincipalID, utterance.Mode, utterance.Strategy, utterance.Trigger,
-		utterance.SpeechStartedAtClientMs, utterance.SpeechStartedAtMs, utterance.ClientClockSkewMs, utterance.ReceivedAtMs)
+		utterance.SpeechStartedAtClientMs, utterance.SpeechStartedAtMs, utterance.ClientClockSkewMs, utterance.ReceivedAtMs,
+		utterance.AudioStreaming, utterance.AudioFormat, utterance.ReplayID)
 	if err != nil {
 		return Utterance{}, false, err
 	}
@@ -354,14 +397,16 @@ func (s *Store) AppendUtteranceError(utteranceID, message string) error {
 // InsertSegment stores a segment; inserted is false when the index was
 // already received, and then nothing changes.
 func (s *Store) InsertSegment(segment Segment) (bool, error) {
-	if segment.Source != SegmentSourceText && segment.Source != SegmentSourceAudio {
-		return false, fmt.Errorf("segment %d of %s: source %q is neither %q nor %q", segment.Index, segment.UtteranceID, segment.Source, SegmentSourceText, SegmentSourceAudio)
+	if !segmentSources[segment.Source] {
+		return false, fmt.Errorf("segment %d of %s: source %q is not one of %s", segment.Index, segment.UtteranceID, segment.Source, sortedKeys(segmentSources))
 	}
 	result, err := s.db.Exec(`INSERT INTO segments (utterance_id, segment_index, text, speech_ended_at_client_ms, speech_ended_at_ms, client_clock_skew_ms, received_at_ms,
-		source, audio_size_bytes, audio_duration_ms, transcription_started_at_ms, transcribed_at_ms, transcript_raw)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (utterance_id, segment_index) DO NOTHING`,
+		source, audio_size_bytes, audio_duration_ms, transcription_started_at_ms, transcribed_at_ms, transcript_raw,
+		detected_speech_start_offset_ms, detected_speech_end_offset_ms, endpointed_at_ms, transcriber)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (utterance_id, segment_index) DO NOTHING`,
 		segment.UtteranceID, segment.Index, segment.Text, segment.SpeechEndedAtClientMs, segment.SpeechEndedAtMs, segment.ClientClockSkewMs, segment.ReceivedAtMs,
-		segment.Source, segment.AudioSizeBytes, segment.AudioDurationMs, segment.TranscriptionStartedAtMs, segment.TranscribedAtMs, segment.TranscriptRaw)
+		segment.Source, segment.AudioSizeBytes, segment.AudioDurationMs, segment.TranscriptionStartedAtMs, segment.TranscribedAtMs, segment.TranscriptRaw,
+		segment.DetectedSpeechStartOffsetMs, segment.DetectedSpeechEndOffsetMs, segment.EndpointedAtMs, segment.Transcriber)
 	if err != nil {
 		return false, err
 	}
@@ -372,7 +417,8 @@ func (s *Store) InsertSegment(segment Segment) (bool, error) {
 // Segments returns an utterance's segments by index.
 func (s *Store) Segments(utteranceID string) ([]Segment, error) {
 	rows, err := s.db.Query(`SELECT utterance_id, segment_index, text, speech_ended_at_client_ms, speech_ended_at_ms, client_clock_skew_ms, received_at_ms,
-		source, audio_size_bytes, audio_duration_ms, transcription_started_at_ms, transcribed_at_ms, transcript_raw
+		source, audio_size_bytes, audio_duration_ms, transcription_started_at_ms, transcribed_at_ms, transcript_raw,
+		detected_speech_start_offset_ms, detected_speech_end_offset_ms, endpointed_at_ms, transcriber
 		FROM segments WHERE utterance_id = ? ORDER BY segment_index`, utteranceID)
 	if err != nil {
 		return nil, err
@@ -383,7 +429,8 @@ func (s *Store) Segments(utteranceID string) ([]Segment, error) {
 		var segment Segment
 		if err := rows.Scan(&segment.UtteranceID, &segment.Index, &segment.Text, &segment.SpeechEndedAtClientMs, &segment.SpeechEndedAtMs,
 			&segment.ClientClockSkewMs, &segment.ReceivedAtMs, &segment.Source, &segment.AudioSizeBytes, &segment.AudioDurationMs,
-			&segment.TranscriptionStartedAtMs, &segment.TranscribedAtMs, &segment.TranscriptRaw); err != nil {
+			&segment.TranscriptionStartedAtMs, &segment.TranscribedAtMs, &segment.TranscriptRaw,
+			&segment.DetectedSpeechStartOffsetMs, &segment.DetectedSpeechEndOffsetMs, &segment.EndpointedAtMs, &segment.Transcriber); err != nil {
 			return nil, err
 		}
 		segment.TranscriptionMs = difference(segment.TranscriptionStartedAtMs, segment.TranscribedAtMs)
@@ -405,10 +452,10 @@ func (s *Store) InsertUtteranceSession(session UtteranceSession) error {
 	if err != nil {
 		return err
 	}
-	return s.exec(`INSERT INTO utterance_sessions (session_id, utterance_id, segment_indexes, text, role, pooled, pooled_session_state, effort, model, instance_id, dispatch_started_at_ms)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+	return s.exec(`INSERT INTO utterance_sessions (session_id, utterance_id, segment_indexes, text, role, pooled, pooled_session_state, effort, model, instance_id, dispatch_started_at_ms, working_directory)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		session.SessionID, session.UtteranceID, string(indexes), session.Text, session.Role, session.Pooled, session.PooledSessionState,
-		session.Effort, session.Model, session.InstanceID, session.DispatchStartedAtMs)
+		session.Effort, session.Model, session.InstanceID, session.DispatchStartedAtMs, session.WorkingDirectory)
 }
 
 // SetSessionRole records a session's role.
@@ -431,6 +478,11 @@ func (s *Store) SetSessionResult(sessionID string, atMs int64) error {
 	return s.exec(`UPDATE utterance_sessions SET result_at_ms = ? WHERE session_id = ? AND result_at_ms IS NULL`, atMs, sessionID)
 }
 
+// SetSessionReply records the result's text and what the turn cost.
+func (s *Store) SetSessionReply(sessionID, text string, costUSD *float64) error {
+	return s.exec(`UPDATE utterance_sessions SET reply_text = ?, turn_cost_usd = ? WHERE session_id = ?`, text, costUSD, sessionID)
+}
+
 // SetSessionStopped records that the session was stopped, and why.
 func (s *Store) SetSessionStopped(sessionID string, atMs int64, reason string) error {
 	return s.exec(`UPDATE utterance_sessions SET stopped_at_ms = ?, stop_reason = ? WHERE session_id = ? AND stopped_at_ms IS NULL`, atMs, reason, sessionID)
@@ -444,7 +496,8 @@ func (s *Store) SetSessionError(sessionID, message string) error {
 // UtteranceSessions returns every session an utterance started, oldest first.
 func (s *Store) UtteranceSessions(utteranceID string) ([]UtteranceSession, error) {
 	rows, err := s.db.Query(`SELECT session_id, utterance_id, segment_indexes, text, role, pooled, pooled_session_state, effort, model, instance_id,
-		dispatch_started_at_ms, dispatched_at_ms, first_block_at_ms, result_at_ms, stopped_at_ms, stop_reason, error
+		dispatch_started_at_ms, dispatched_at_ms, first_block_at_ms, result_at_ms, stopped_at_ms, stop_reason, error,
+		working_directory, reply_text, turn_cost_usd
 		FROM utterance_sessions WHERE utterance_id = ? ORDER BY rowid`, utteranceID)
 	if err != nil {
 		return nil, err
@@ -456,7 +509,8 @@ func (s *Store) UtteranceSessions(utteranceID string) ([]UtteranceSession, error
 		var indexes string
 		if err := rows.Scan(&session.SessionID, &session.UtteranceID, &indexes, &session.Text, &session.Role, &session.Pooled, &session.PooledSessionState,
 			&session.Effort, &session.Model, &session.InstanceID, &session.DispatchStartedAtMs, &session.DispatchedAtMs, &session.FirstBlockAtMs,
-			&session.ResultAtMs, &session.StoppedAtMs, &session.StopReason, &session.Error); err != nil {
+			&session.ResultAtMs, &session.StoppedAtMs, &session.StopReason, &session.Error,
+			&session.WorkingDirectory, &session.ReplyText, &session.TurnCostUSD); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(indexes), &session.SegmentIndexes); err != nil {
