@@ -38,7 +38,14 @@ time with it. Both values are stored.
 | `GET /api/voice/utterances?limit=50` | the caller's utterances, newest first |
 | `GET /api/voice/utterances/{id}/events` | Server-Sent Events, below |
 | `GET /api/voice/settings`, `PATCH /api/voice/settings` | the settings below; an unknown field or a value of the wrong type is 400 and nothing is written |
-| `GET /api/voice/latency?group_by=strategy\|pooled\|trigger\|source` | median intervals per group, below |
+| `POST /api/voice/utterances/{id}/audio-stream?offset_bytes=N` | contract v2: body raw 16 kHz mono 16-bit PCM → 200 `{"received_bytes"}`; an offset below the total is a repeat, its overlap ignored; above it → 409 `{"expected_offset_bytes"}`; after stop → 409 |
+| `POST /api/voice/utterances/{id}/stop` | contract v2: `{"ended_at_ms","reason"}` → 200; reason is `user`, `reply_playing`, `max_duration`, `continuation_window_closed` or `no_speech` |
+| `GET /api/voice/latency?group_by=strategy\|pooled\|trigger\|source\|configuration` | median intervals per group, below |
+| `POST /api/voice/replay-recordings?expected_text=…&ground_truth_transcriber=…` | body a 16 kHz mono WAV → 201 the recording, with the true speech end from the transcriber's word times (or `true_speech_end_ms` with `true_speech_end_source`) |
+| `GET /api/voice/replay-recordings` | every recording kept for replay |
+| `POST /api/voice/replay-configurations`, `GET …` | a named way to run a replay, below |
+| `POST /api/voice/replays` | `{"configuration_id", "recording_id"}` or `{"configuration_id","text"}` → 202 the replay; it runs in the background |
+| `GET /api/voice/replays?configuration_id=…`, `GET /api/voice/replays/{replay_id}` | replays with their utterance, transcript, word accuracy, replies and timings |
 | `GET /health` | `{"status":"ok"}` |
 | `GET /settings` | every setting, where its value came from; secrets only as set or not |
 
@@ -54,6 +61,15 @@ quiet stream; the answer carries `X-Accel-Buffering: no`.
 - `event: session_event` `{"session_id","event":<the llm-bridge-server event, unchanged>}`, for sessions not superseded. The reply is the `result` event's text.
 - `event: error` `{"message"}`, when a session could not be started, sent to or stopped (an addition: see *Contract changes*)
 - `event: done` `{}`
+- Streaming utterances also get `event: hearing` `{"speech"}` when the detector starts or stops hearing speech, `event: transcript` `{"index","text"}` once a segment is transcribed, and `event: stop_recording` `{"reason":"continuation_window_closed|max_duration|no_speech"}`, sent once.
+
+## Streaming: the server ends the segments
+
+An utterance made with `"audio_streaming":true,"audio_format":"pcm_s16le_16000_mono"` sends its sound as it is recorded, and this service cuts it into segments. Byte 0 of the stream is `speech_started_at_ms`. Each chunk is scored by speech-server's Silero voice activity detector (`VOICE_INTAKE_SPEECH_DETECTION_URL`), 32 ms windows with the LSTM state kept across chunks; the endpointer in `speech_detection.go` hears speech from a window scoring 0.5, keeps hearing it down to 0.35, and ends a segment when silence has lasted `endpoint_silence_ms` (`eager_silence_ms` under the eager strategy). Speech shorter than 200 ms — a click, the phone's start tick — is dropped. A segment is cut with 200 ms either side, transcribed by the `transcriber` setting's service, stored with source `stream`, and dispatched like any other. Long mode and the manual strategy end no segment on a pause: the speech is one segment, cut at `stop`. `stop_recording` is sent when `maximum_recording_ms` of audio has arrived, when `no_speech_timeout_ms` has passed with no speech, or (quick mode) when `continuation_window_ms` has passed since the last segment's speech ended. At `stop` an open segment ends at the end of the audio received; once every segment is transcribed the recording is shared into the kept sessions as `utterance_NNNNNN.wav` and the decisions become final. A failed transcription in a stream stores the segment with no words, so later segments are not held up.
+
+## Replays
+
+A replay runs a stored recording through the streaming path at the pace it was spoken, in 200 ms chunks, or sends a stored text, under a named **configuration**: detector and `endpoint_silence_ms`, `transcriber`, `dispatch` (`session`, `oneshot` — one `POST /instances/{id}/oneshot` call with no tools — or `none`), `instance_id`, `model`, `effort`, `working_directory` and the `prompt_variant` it stands for, `warm_session` (start the session first and give it 15 s, as the pool would) and `max_budget_usd` (required for sessions). The replay stops as the phone would: on `stop_recording`, or with reason `user` where the recording ends. Its sessions are stopped and archived once their turn is over. A recording's true speech end, from word times, is what `endpoint_delay` is measured against. `GET /api/voice/latency?group_by=configuration` reports per configuration the medians of `endpoint_delay`, `detected_speech_end_error`, `transcription`, `speech_end_to_transcribed`, `dispatched_to_first_block`, `dispatched_to_result`, `speech_end_to_first_block` and `speech_end_to_result` (speech end is the true end for a recording and the send for a text), the mean word accuracy against the expected text (spoken numbers read as digits), and the sum of the turns' reported cost.
 
 ## How segments are dispatched
 
@@ -70,7 +86,7 @@ last segment that had words.
 - **Final decisions**: after `finish`, or when the window passes with no new segment, every session still speculative is kept and nothing more is superseded.
 - **Segments are handled one at a time per utterance, in index order.** A segment that arrives while the previous one is still being judged waits for that decision, so a request is never joined onto a session that is about to be superseded. A segment that arrives out of order waits for the missing index.
 - **When the judge fails**, the joined session is kept, since its text holds every word, and the failure is in the decision's reason and the judgment row. When only one of the two new sessions could be started, that one decides.
-- **Effort** is `default_effort` unless the text contains one of `effort_raising_phrases` (any case), and then `raised_effort`. A raised-effort text never goes to a pooled session, which runs at the default.
+- **Effort** is `default_effort` unless the text contains one of `effort_raising_phrases` (any case) or the utterance is in long mode, and then `raised_effort`, on `raised_instance_id` and `raised_model` when they are set. A raised text never goes to a pooled session, which runs at the default.
 
 ## The pool
 
@@ -87,9 +103,13 @@ depends on gives up the waiting sessions that no longer match.
 
 ## Transcription
 
-`POST …/segments/{index}/audio` sends the WAV to the whisper.cpp
-`whisper-server` at `VOICE_INTAKE_TRANSCRIPTION_URL` (its inference route),
-at temperature 0 and whisper's full 30-second audio context: a context sized
+`POST …/segments/{index}/audio` and a streamed segment send the WAV to the
+transcription service the `transcriber` setting names in
+`VOICE_INTAKE_TRANSCRIBERS`: a whisper.cpp `whisper-server`, or speech-server
+(`speech-server/`), which keeps a Parakeet TDT model in memory, answers the
+same inference form and adds word times. Measured on four phone recordings
+cut to their speech: Parakeet 0.6b q8_0 0.2–0.45 s, whisper base.en about
+1.0 s, the same words. Whisper is called at temperature 0 and whisper's full 30-second audio context: a context sized
 to the clip was about three times faster when measured, but repeated
 sentences and turned silence into words. The transcript is kept as the
 server gave it (`transcript_raw`); the segment's text is that with
@@ -124,19 +144,25 @@ segment the session's text holds, with the number of samples behind each.
 | `instance_id` | empty | `VOICE_INTAKE_INSTANCE_ID` |
 | `endpoint_silence_ms` | 900 | `VOICE_INTAKE_ENDPOINT_SILENCE_MS` |
 | `eager_silence_ms` | 350 | `VOICE_INTAKE_EAGER_SILENCE_MS` |
+| `transcriber` | empty | `VOICE_INTAKE_TRANSCRIBER` |
+| `no_speech_timeout_ms` | 6000 | `VOICE_INTAKE_NO_SPEECH_TIMEOUT_MS` |
+| `maximum_recording_ms` | 300000 | `VOICE_INTAKE_MAXIMUM_RECORDING_MS` |
+| `raised_instance_id` | empty: `instance_id` | `VOICE_INTAKE_RAISED_INSTANCE_ID` |
+| `raised_model` | empty: `default_model` | `VOICE_INTAKE_RAISED_MODEL` |
 
-These nine are stored in the database: the environment seeds each once, and
+These are stored in the database: the environment seeds each once, and
 after that `PATCH /api/voice/settings` changes them. A new
 `continuation_judge_model_role` is checked against model-store's roles, a new
 `default_model` against its models, and a new `instance_id` against
 llm-bridge-server's instances; when the owner cannot be asked the answer is
-502. The phone reads `endpoint_silence_ms` and `eager_silence_ms`.
+502; a new `transcriber` must be a name in `VOICE_INTAKE_TRANSCRIBERS`, and `raised_model` and `raised_instance_id` are checked like `default_model` and `instance_id`. The phone reads `endpoint_silence_ms` and `eager_silence_ms` when it cuts segments itself; for a streaming utterance this service uses them.
 
 Read only from the environment: `VOICE_INTAKE_ADDR` (127.0.0.1:8332),
 `VOICE_INTAKE_DATA_DIR`, `VOICE_INTAKE_LLM_BRIDGE_URL`,
-`VOICE_INTAKE_MODEL_STORE_URL`, `VOICE_INTAKE_TRANSCRIPTION_URL` (a
-whisper-server inference route, such as `http://127.0.0.1:<port>/inference`;
-empty: the segment audio route answers 503), `VOICE_INTAKE_SESSION_WORKING_DIR` (empty: the
+`VOICE_INTAKE_MODEL_STORE_URL`, `VOICE_INTAKE_TRANSCRIBERS` (name:url pairs,
+each url an inference route such as `http://127.0.0.1:<port>/inference`),
+`VOICE_INTAKE_SPEECH_DETECTION_URL` (speech-server's address; empty: a
+streaming utterance is refused with 503), `VOICE_INTAKE_SESSION_WORKING_DIR` (empty: the
 instance's directory), `VOICE_INTAKE_RAISED_EFFORT` (high), and
 `LLMBRIDGE_SERVICE_TOKEN` (required). A set `VOICE_INTAKE_` variable that is
 not declared stops the start.
@@ -146,8 +172,23 @@ not declared stops the start.
 The unit file sets only the listen address. Put the rest in a host-local
 drop-in, `~/.config/systemd/user/voice-intake.service.d/host.conf`, mode 600:
 an `EnvironmentFile=` holding `LLMBRIDGE_SERVICE_TOKEN`, the instance and
-working directory, and `VOICE_INTAKE_TRANSCRIPTION_URL`. The whisper-server it
-names is run by the host, not by this repo. The prompt every voice session reads is the project prompt
+working directory, `VOICE_INTAKE_TRANSCRIBERS`, `VOICE_INTAKE_TRANSCRIBER` and
+`VOICE_INTAKE_SPEECH_DETECTION_URL`. A whisper-server is run by the host, not
+by this repo.
+
+speech-server (`speech-server/`, its own Go module) links whisper.cpp's
+`libparakeet` and `libwhisper` through cgo. `deploy.sh` builds it with
+`CGO_CFLAGS` and `CGO_LDFLAGS` from `~/.config/speech-server/build.env`
+(headers and libraries of a whisper.cpp build that has Parakeet), and installs
+`speech-server.service`, which sets only `SPEECH_SERVER_ADDR`
+(127.0.0.1:8335). A drop-in beside it sets `SPEECH_SERVER_PARAKEET_MODEL` (a
+ggml Parakeet TDT model), `SPEECH_SERVER_VOICE_ACTIVITY_MODEL` (a ggml Silero
+VAD model, ggml-org/whisper-vad), `SPEECH_SERVER_THREADS` and the library path.
+Its routes: `POST /inference` (whisper-server's form; answers `text`, `words`
+with `start_ms`/`end_ms`, `transcription_ms`), `POST /vad/streams/{id}` (raw
+PCM in, `{"window_samples","first_window","probabilities"}` out, state kept per
+stream; a new stream's state is cleared, or two streams score the same audio
+differently), `DELETE /vad/streams/{id}`, `GET /health`, `GET /settings`. The prompt every voice session reads is the project prompt
 collection rooted at `VOICE_INTAKE_SESSION_WORKING_DIR`, kept in agent-store
 like any other prompt; Claude Code reads its rendered `CLAUDE.md` because the
 session starts there.
@@ -178,4 +219,8 @@ which a client that ignores unknown fields and events has to handle:
 - `POST /api/voice/utterances/{id}/segments/{index}/audio`: the phone may send a segment's sound instead of its text, and the service transcribes it. Answers as in *Routes*. A transcript with no words uses up the index; a failed transcription does not.
 - Each segment in `GET /api/voice/utterances/{id}` carries `source` (`text` or `audio`), and an audio one also `audio_size_bytes`, `audio_duration_ms`, `transcription_started_at_ms`, `transcribed_at_ms`, `transcription_ms` and `transcript_raw`. An audio segment with no words appears with empty `text`.
 - `GET /api/voice/latency` takes `group_by=source` and reports two more medians, `transcription` and `speech_end_to_transcribed`.
+- Contract v2 (streaming) is implemented as written, with these additions: `POST …/stop` takes the `stop_recording` reasons (`continuation_window_closed`, `no_speech`, `max_duration`) as well as `user` and `reply_playing`, since the phone sends the server's reason back; `audio-stream` answers 409 after `stop`, and 400 for an odd byte count or offset; a streamed segment has source `stream` and carries `detected_speech_start_offset_ms`, `detected_speech_end_offset_ms`, `endpointed_at_ms` and `transcriber`; an utterance carries `audio_streaming`, `audio_format`, `stream_received_bytes`, `stop_recording_reason`, `stop_recording_sent_at_ms`, `stopped_at_ms`, `stopped_at_client_ms`, `stop_reason` and `replay_id`.
+- `GET /api/voice/settings` carries five more fields: `transcriber`, `no_speech_timeout_ms`, `maximum_recording_ms`, `raised_instance_id`, `raised_model`.
+- A session in `GET /api/voice/utterances/{id}` carries `working_directory`, `reply_text` and `turn_cost_usd`.
+- Replay routes and `GET /api/voice/latency?group_by=configuration`, above. They are for measuring settings, not for the phone.
 - `GET /api/voice/utterances/{id}` and the list carry more fields than the contract names: the phone's own timestamps beside the server-time ones, the clock skew, audio details, errors and the continuation judgments.
