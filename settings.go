@@ -39,20 +39,22 @@ const (
 // Keys of the settings the phone and the operator read and change through
 // GET and PATCH /api/voice/settings. Each key is the contract's field name.
 const (
-	SettingPoolSize                       = "pool_size"
-	SettingContinuationWindowMilliseconds = "continuation_window_ms"
-	SettingDefaultEffort                  = "default_effort"
-	SettingDefaultModel                   = "default_model"
-	SettingEffortRaisingPhrases           = "effort_raising_phrases"
-	SettingContinuationJudgeModelRole     = "continuation_judge_model_role"
-	SettingInstanceID                     = "instance_id"
-	SettingEndpointSilenceMilliseconds    = "endpoint_silence_ms"
-	SettingEagerSilenceMilliseconds       = "eager_silence_ms"
-	SettingTranscriber                    = "transcriber"
-	SettingNoSpeechTimeoutMilliseconds    = "no_speech_timeout_ms"
-	SettingMaximumRecordingMilliseconds   = "maximum_recording_ms"
-	SettingRaisedInstanceID               = "raised_instance_id"
-	SettingRaisedModel                    = "raised_model"
+	SettingPoolSize                            = "pool_size"
+	SettingContinuationWindowMilliseconds      = "continuation_window_ms"
+	SettingDefaultEffort                       = "default_effort"
+	SettingDefaultModel                        = "default_model"
+	SettingEffortRaisingPhrases                = "effort_raising_phrases"
+	SettingContinuationJudgeModelRole          = "continuation_judge_model_role"
+	SettingInstanceID                          = "instance_id"
+	SettingEndpointSilenceMilliseconds         = "endpoint_silence_ms"
+	SettingEagerSilenceMilliseconds            = "eager_silence_ms"
+	SettingTranscriber                         = "transcriber"
+	SettingNoSpeechTimeoutMilliseconds         = "no_speech_timeout_ms"
+	SettingMaximumRecordingMilliseconds        = "maximum_recording_ms"
+	SettingRaisedInstanceID                    = "raised_instance_id"
+	SettingRaisedModel                         = "raised_model"
+	SettingHighPassCutoffHertz                 = "high_pass_cutoff_hz"
+	SettingMinimumSegmentMeanSpeechProbability = "minimum_segment_mean_speech_probability"
 )
 
 // DefaultListenAddress is where the service listens with nothing set.
@@ -123,6 +125,10 @@ func SettingDefinitions() []servicesettings.Definition {
 			Description: "The llm-bridge-server instance a long-mode utterance, or a text holding an effort-raising phrase, starts its session on. Empty: instance_id."},
 		{Key: SettingRaisedModel, EnvironmentVariable: "VOICE_INTAKE_RAISED_MODEL", Kind: behaviour, ValueType: text, Editable: true,
 			Description: "The model, by model-store id, of a long-mode utterance or a text holding an effort-raising phrase. Empty: default_model."},
+		{Key: SettingHighPassCutoffHertz, EnvironmentVariable: "VOICE_INTAKE_HIGH_PASS_CUTOFF_HZ", Kind: behaviour, ValueType: integer, Default: "80", Editable: true,
+			Description: "Streamed audio and posted segment audio pass a second-order high-pass filter with this cutoff, in hertz, before the speech detector and the transcriber hear it, to cut the rumble of wind and handling. The recording shared into sessions is left as it was. Zero: no filter."},
+		{Key: SettingMinimumSegmentMeanSpeechProbability, EnvironmentVariable: "VOICE_INTAKE_MINIMUM_SEGMENT_MEAN_SPEECH_PROBABILITY", Kind: behaviour, ValueType: msg.ServiceSettingValueTypeDecimal, Default: "0.8", Editable: true,
+			Description: "A streamed segment whose mean Silero speech probability, over the windows the detector counted as its speech, is below this is kept with no words and its reason, and is neither transcribed nor sent: noise the detector half-heard as speech. Zero: every segment is transcribed."},
 	}
 }
 
@@ -139,6 +145,7 @@ var voiceSettingKeys = []string{
 	SettingEndpointSilenceMilliseconds, SettingEagerSilenceMilliseconds,
 	SettingTranscriber, SettingNoSpeechTimeoutMilliseconds, SettingMaximumRecordingMilliseconds,
 	SettingRaisedInstanceID, SettingRaisedModel,
+	SettingHighPassCutoffHertz, SettingMinimumSegmentMeanSpeechProbability,
 }
 
 func voiceSettingValueType(key string) msg.ServiceSettingValueType {
@@ -166,6 +173,8 @@ func VoiceSettings(registry *servicesettings.Registry) map[string]any {
 			answer[key] = phrases
 		case msg.ServiceSettingValueTypeModelRole:
 			answer[key] = registry.ModelRole(key)
+		case msg.ServiceSettingValueTypeDecimal:
+			answer[key] = registry.Decimal(key)
 		default:
 			answer[key] = registry.String(key)
 		}
@@ -197,6 +206,12 @@ func voiceSettingsPatch(body []byte) (map[string]string, error) {
 				return nil, fmt.Errorf("%s must be a whole number of zero or more, got %s", key, raw)
 			}
 			changes[key] = strconv.Itoa(number)
+		case msg.ServiceSettingValueTypeDecimal:
+			var number float64
+			if err := json.Unmarshal(raw, &number); err != nil || number < 0 || number > 1 {
+				return nil, fmt.Errorf("%s must be a number from 0 to 1, got %s", key, raw)
+			}
+			changes[key] = strconv.FormatFloat(number, 'f', -1, 64)
 		case msg.ServiceSettingValueTypeStringList:
 			var phrases []string
 			if err := json.Unmarshal(raw, &phrases); err != nil {
@@ -244,18 +259,26 @@ type StreamSettings struct {
 	MaximumRecording   time.Duration
 	ContinuationWindow time.Duration
 	Transcriber        string
+	// HighPassCutoffHertz filters the audio before the detector and the
+	// transcriber; zero leaves it as it is.
+	HighPassCutoffHertz int
+	// MinimumSegmentMeanSpeechProbability drops a segment the detector
+	// barely heard as speech; zero drops none.
+	MinimumSegmentMeanSpeechProbability float64
 }
 
 // StreamSettingsFrom reads StreamSettings from the registry.
 func StreamSettingsFrom(registry *servicesettings.Registry) StreamSettings {
 	milliseconds := func(key string) time.Duration { return time.Duration(registry.Integer(key)) * time.Millisecond }
 	return StreamSettings{
-		EndpointSilence:    milliseconds(SettingEndpointSilenceMilliseconds),
-		EagerSilence:       milliseconds(SettingEagerSilenceMilliseconds),
-		NoSpeechTimeout:    milliseconds(SettingNoSpeechTimeoutMilliseconds),
-		MaximumRecording:   milliseconds(SettingMaximumRecordingMilliseconds),
-		ContinuationWindow: milliseconds(SettingContinuationWindowMilliseconds),
-		Transcriber:        registry.String(SettingTranscriber),
+		EndpointSilence:                     milliseconds(SettingEndpointSilenceMilliseconds),
+		EagerSilence:                        milliseconds(SettingEagerSilenceMilliseconds),
+		NoSpeechTimeout:                     milliseconds(SettingNoSpeechTimeoutMilliseconds),
+		MaximumRecording:                    milliseconds(SettingMaximumRecordingMilliseconds),
+		ContinuationWindow:                  milliseconds(SettingContinuationWindowMilliseconds),
+		Transcriber:                         registry.String(SettingTranscriber),
+		HighPassCutoffHertz:                 registry.Integer(SettingHighPassCutoffHertz),
+		MinimumSegmentMeanSpeechProbability: registry.Decimal(SettingMinimumSegmentMeanSpeechProbability),
 	}
 }
 

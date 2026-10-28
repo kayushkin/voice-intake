@@ -124,6 +124,10 @@ type ReplayConfiguration struct {
 	WarmSession       bool    `json:"warm_session"`
 	MaxBudgetUSD      float64 `json:"max_budget_usd"`
 	CreatedAtMs       int64   `json:"created_at_ms"`
+	// HighPassCutoffHertz and MinimumSegmentMeanSpeechProbability are the
+	// live settings of the same names; zero turns each off.
+	HighPassCutoffHertz                 int     `json:"high_pass_cutoff_hz"`
+	MinimumSegmentMeanSpeechProbability float64 `json:"minimum_segment_mean_speech_probability"`
 }
 
 // InsertReplayConfiguration stores a configuration and gives it its id.
@@ -139,23 +143,26 @@ func (s *Store) InsertReplayConfiguration(configuration ReplayConfiguration) (Re
 	}
 	configuration.ConfigurationID = fmt.Sprintf("configuration_%06d", next)
 	if _, err := transaction.Exec(`INSERT INTO replay_configurations (sequence, configuration_id, name, detector, endpoint_silence_ms, transcriber, dispatch,
-		instance_id, model, effort, working_directory, prompt_variant, warm_session, max_budget_usd, created_at_ms) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		instance_id, model, effort, working_directory, prompt_variant, warm_session, max_budget_usd, created_at_ms,
+		high_pass_cutoff_hz, minimum_segment_mean_speech_probability) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		next, configuration.ConfigurationID, configuration.Name, configuration.Detector, configuration.EndpointSilenceMs, configuration.Transcriber,
 		configuration.Dispatch, configuration.InstanceID, configuration.Model, configuration.Effort, configuration.WorkingDirectory,
-		configuration.PromptVariant, configuration.WarmSession, configuration.MaxBudgetUSD, configuration.CreatedAtMs); err != nil {
+		configuration.PromptVariant, configuration.WarmSession, configuration.MaxBudgetUSD, configuration.CreatedAtMs,
+		configuration.HighPassCutoffHertz, configuration.MinimumSegmentMeanSpeechProbability); err != nil {
 		return ReplayConfiguration{}, err
 	}
 	return configuration, transaction.Commit()
 }
 
 const replayConfigurationColumns = `configuration_id, name, detector, endpoint_silence_ms, transcriber, dispatch, instance_id, model, effort,
-	working_directory, prompt_variant, warm_session, max_budget_usd, created_at_ms`
+	working_directory, prompt_variant, warm_session, max_budget_usd, created_at_ms, high_pass_cutoff_hz, minimum_segment_mean_speech_probability`
 
 func scanReplayConfiguration(row rowScanner) (ReplayConfiguration, error) {
 	var configuration ReplayConfiguration
 	err := row.Scan(&configuration.ConfigurationID, &configuration.Name, &configuration.Detector, &configuration.EndpointSilenceMs,
 		&configuration.Transcriber, &configuration.Dispatch, &configuration.InstanceID, &configuration.Model, &configuration.Effort,
-		&configuration.WorkingDirectory, &configuration.PromptVariant, &configuration.WarmSession, &configuration.MaxBudgetUSD, &configuration.CreatedAtMs)
+		&configuration.WorkingDirectory, &configuration.PromptVariant, &configuration.WarmSession, &configuration.MaxBudgetUSD, &configuration.CreatedAtMs,
+		&configuration.HighPassCutoffHertz, &configuration.MinimumSegmentMeanSpeechProbability)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ReplayConfiguration{}, ErrNotFound
 	}

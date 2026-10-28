@@ -144,6 +144,12 @@ func (s *Server) createReplayConfiguration(w http.ResponseWriter, r *http.Reques
 	if configuration.Dispatch == DispatchSession && configuration.MaxBudgetUSD <= 0 {
 		problems = append(problems, "max_budget_usd is required for dispatch session: every replay session runs with a spend ceiling")
 	}
+	if configuration.HighPassCutoffHertz < 0 || configuration.HighPassCutoffHertz >= segmentAudioSampleRate/2 {
+		problems = append(problems, fmt.Sprintf("high_pass_cutoff_hz is zero (no filter) or more, below %d", segmentAudioSampleRate/2))
+	}
+	if configuration.MinimumSegmentMeanSpeechProbability < 0 || configuration.MinimumSegmentMeanSpeechProbability > 1 {
+		problems = append(problems, "minimum_segment_mean_speech_probability is from 0 (keep every segment) to 1")
+	}
 	if configuration.WarmSession && configuration.Dispatch != DispatchSession {
 		problems = append(problems, "warm_session is for dispatch session")
 	}
@@ -386,7 +392,8 @@ func (d *Dispatcher) replay(principalID string, replay Replay, configuration Rep
 	} else {
 		options := StreamOptions{Silence: time.Duration(configuration.EndpointSilenceMs) * time.Millisecond, NoSpeechTimeout: streamSettings.NoSpeechTimeout,
 			MaximumRecording: streamSettings.MaximumRecording, ContinuationWindow: streamSettings.ContinuationWindow,
-			TranscriberName: configuration.Transcriber, Replay: true}
+			TranscriberName: configuration.Transcriber, Replay: true, HighPassCutoffHertz: configuration.HighPassCutoffHertz,
+			MinimumSegmentMeanSpeechProbability: configuration.MinimumSegmentMeanSpeechProbability}
 		if err := d.StartStream(utterance, options); err != nil {
 			return err
 		}

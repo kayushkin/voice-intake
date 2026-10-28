@@ -272,7 +272,10 @@ func newHarness(t *testing.T, environment map[string]string) *harness {
 func newHarnessWithTranscribers(t *testing.T, environment map[string]string, extra Transcribers) *harness {
 	t.Helper()
 	variables := map[string]string{"LLMBRIDGE_SERVICE_TOKEN": "test-token", "VOICE_INTAKE_INSTANCE_ID": "instance-for-tests", "VOICE_INTAKE_POOL_SIZE": "0",
-		"VOICE_INTAKE_TRANSCRIBER": "fake"}
+		"VOICE_INTAKE_TRANSCRIBER": "fake",
+		// The fakes read meaning out of raw sample bytes, which a filter would
+		// change; tests that want the filter or the weak-speech gate set them.
+		"VOICE_INTAKE_HIGH_PASS_CUTOFF_HZ": "0", "VOICE_INTAKE_MINIMUM_SEGMENT_MEAN_SPEECH_PROBABILITY": "0"}
 	for key, value := range environment {
 		variables[key] = value
 	}

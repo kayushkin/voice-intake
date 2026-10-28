@@ -60,6 +60,13 @@ type StreamOptions struct {
 	MaximumRecording   time.Duration
 	ContinuationWindow time.Duration
 	TranscriberName    string
+	// HighPassCutoffHertz filters the audio the detector and the transcriber
+	// hear; zero leaves it as recorded.
+	HighPassCutoffHertz int
+	// MinimumSegmentMeanSpeechProbability keeps a segment the detector
+	// barely heard as speech with no words, untranscribed; zero keeps none
+	// back.
+	MinimumSegmentMeanSpeechProbability float64
 	// Replay streams do not share the assembled recording into sessions.
 	Replay bool
 }
@@ -67,7 +74,8 @@ type StreamOptions struct {
 // StreamOptionsFor picks the silence for the utterance's mode and strategy.
 func StreamOptionsFor(utterance Utterance, settings StreamSettings) StreamOptions {
 	options := StreamOptions{NoSpeechTimeout: settings.NoSpeechTimeout, MaximumRecording: settings.MaximumRecording,
-		ContinuationWindow: settings.ContinuationWindow, TranscriberName: settings.Transcriber}
+		ContinuationWindow: settings.ContinuationWindow, TranscriberName: settings.Transcriber,
+		HighPassCutoffHertz: settings.HighPassCutoffHertz, MinimumSegmentMeanSpeechProbability: settings.MinimumSegmentMeanSpeechProbability}
 	switch {
 	case utterance.Mode == "long" || utterance.Strategy == "manual":
 	case utterance.Strategy == "eager":
@@ -86,8 +94,15 @@ type audioStream struct {
 	transcriber SpeechTranscriber
 	detector    SpeechDetector
 
-	mutex               sync.Mutex
-	pcm                 []byte
+	mutex sync.Mutex
+	// pcm is the audio as recorded, which is shared into sessions;
+	// heardPCM is what the detector and the transcriber hear: pcm through
+	// the high-pass filter, or pcm itself when there is none.
+	pcm      []byte
+	heardPCM []byte
+	highPass *highPassFilter
+	// probabilities holds every window's speech probability, by window.
+	probabilities       []float64
 	endpointer          *endpointer
 	windowSamples       int
 	nextSegmentIndex    int
@@ -127,7 +142,7 @@ func (d *Dispatcher) StartStream(utterance Utterance, options StreamOptions) err
 	defer run.mutex.Unlock()
 	if run.stream == nil {
 		run.stream = &audioStream{run: run, utterance: utterance, options: options, transcriber: transcriber, detector: d.detector,
-			stopRecording: make(chan struct{})}
+			stopRecording: make(chan struct{}), highPass: newHighPassFilter(options.HighPassCutoffHertz)}
 	}
 	return nil
 }
@@ -176,12 +191,19 @@ func (stream *audioStream) append(ctx context.Context, offset int64, chunk []byt
 	}
 	fresh := chunk[overlap:]
 	stream.pcm = append(stream.pcm, fresh...)
+	heard := fresh
+	if stream.highPass != nil {
+		heard = stream.highPass.filter(fresh)
+		stream.heardPCM = append(stream.heardPCM, heard...)
+	} else {
+		stream.heardPCM = stream.pcm
+	}
 	total = int64(len(stream.pcm))
 	d := stream.run.dispatcher
 	if err := d.store.SetStreamReceivedBytes(stream.utterance.UtteranceID, total); err != nil {
 		log.Printf("[stream] ERROR %s: %v", stream.utterance.UtteranceID, err)
 	}
-	scores, err := stream.detector.Score(ctx, stream.utterance.UtteranceID, fresh)
+	scores, err := stream.detector.Score(ctx, stream.utterance.UtteranceID, heard)
 	if err != nil {
 		stream.run.recordError(fmt.Sprintf("speech detector: %v", err))
 		return total, err
@@ -190,6 +212,7 @@ func (stream *audioStream) append(ctx context.Context, offset int64, chunk []byt
 		stream.windowSamples = scores.WindowSamples
 		stream.endpointer = newEndpointer(scores.WindowSamples, stream.options.Silence)
 	}
+	stream.probabilities = append(stream.probabilities, scores.Probabilities...)
 	for index, probability := range scores.Probabilities {
 		event := stream.endpointer.feed(scores.FirstWindow+index, probability)
 		stream.act(event)
@@ -251,31 +274,83 @@ func (stream *audioStream) endSegment(startSample, endSample int) {
 	stream.lastSpeechEndSample = endSample
 	paddingSamples := int(segmentPadding.Milliseconds()) * segmentAudioSampleRate / 1000
 	fromByte := max(0, (startSample-paddingSamples)*2)
-	toByte := min(len(stream.pcm), (endSample+paddingSamples)*2)
-	wav := pcmToWAV(stream.pcm[fromByte:toByte])
+	toByte := min(len(stream.heardPCM), (endSample+paddingSamples)*2)
+	wav := pcmToWAV(stream.heardPCM[fromByte:toByte])
 	startOffsetMs := int64(startSample) * 1000 / segmentAudioSampleRate
 	endOffsetMs := int64(endSample) * 1000 / segmentAudioSampleRate
+	strength := stream.speechStrength(startSample, endSample)
 	stream.pending.Add(1)
 	go func() {
 		defer stream.pending.Done()
-		stream.transcribeSegment(index, wav, startOffsetMs, endOffsetMs, endpointedAtMs)
+		stream.transcribeSegment(index, wav, startOffsetMs, endOffsetMs, endpointedAtMs, strength)
 	}()
+}
+
+// speechStrength is how surely the detector heard speech in a segment.
+type speechStrength struct {
+	// MeanSpeechProbability is the mean over the segment's windows, from
+	// the first it heard as speech to the last.
+	MeanSpeechProbability float64
+	// VoicedMs is the audio in windows scoring at least the speech-start
+	// threshold.
+	VoicedMs int64
+}
+
+// speechStrength measures the windows of samples [startSample, endSample).
+// The caller holds stream.mutex.
+func (stream *audioStream) speechStrength(startSample, endSample int) speechStrength {
+	if stream.windowSamples <= 0 {
+		return speechStrength{}
+	}
+	first := startSample / stream.windowSamples
+	last := min(len(stream.probabilities), (endSample+stream.windowSamples-1)/stream.windowSamples)
+	if last <= first {
+		return speechStrength{}
+	}
+	sum, voiced := 0.0, 0
+	for _, probability := range stream.probabilities[first:last] {
+		sum += probability
+		if probability >= speechStartProbability {
+			voiced++
+		}
+	}
+	return speechStrength{MeanSpeechProbability: sum / float64(last-first),
+		VoicedMs: int64(voiced * stream.windowSamples * 1000 / segmentAudioSampleRate)}
+}
+
+// weakSpeechReason says why a segment is too weakly heard to transcribe,
+// or is empty when it is not.
+func weakSpeechReason(strength speechStrength, minimumMeanSpeechProbability float64) string {
+	if minimumMeanSpeechProbability <= 0 || strength.MeanSpeechProbability >= minimumMeanSpeechProbability {
+		return ""
+	}
+	return fmt.Sprintf("weak speech: the detector's mean speech probability over the segment was %.2f, below the %.2f of %s (%d ms voiced), so it was neither transcribed nor sent",
+		strength.MeanSpeechProbability, minimumMeanSpeechProbability, SettingMinimumSegmentMeanSpeechProbability, strength.VoicedMs)
 }
 
 // transcribeSegment transcribes a cut segment, stores it and hands it to
 // dispatch. A failed transcription is stored with no words, so the indexes
 // after it are not held up: in a stream nobody sends the segment again.
-func (stream *audioStream) transcribeSegment(index int, wav []byte, startOffsetMs, endOffsetMs, endpointedAtMs int64) {
+func (stream *audioStream) transcribeSegment(index int, wav []byte, startOffsetMs, endOffsetMs, endpointedAtMs int64, strength speechStrength) {
 	d := stream.run.dispatcher
 	utterance := stream.utterance
-	ctx, cancel := context.WithTimeout(context.Background(), segmentTranscriptionLimit)
-	defer cancel()
-	startedAtMs := d.now().UnixMilli()
-	transcript, err := stream.transcriber.Transcribe(ctx, wav)
-	transcribedAtMs := d.now().UnixMilli()
-	if err != nil {
-		stream.run.recordError(fmt.Sprintf("segment %d: transcription failed after %d ms, so it is kept with no words: %v", index, transcribedAtMs-startedAtMs, err))
-		transcript = Transcript{}
+	droppedReason := weakSpeechReason(strength, stream.options.MinimumSegmentMeanSpeechProbability)
+	var transcript Transcript
+	var startedAtMs, transcribedAtMs *int64
+	if droppedReason == "" {
+		ctx, cancel := context.WithTimeout(context.Background(), segmentTranscriptionLimit)
+		defer cancel()
+		started := d.now().UnixMilli()
+		var err error
+		transcript, err = stream.transcriber.Transcribe(ctx, wav)
+		transcribed := d.now().UnixMilli()
+		startedAtMs, transcribedAtMs = &started, &transcribed
+		if err != nil {
+			stream.run.recordError(fmt.Sprintf("segment %d: transcription failed after %d ms, so it is kept with no words: %v", index, transcribed-started, err))
+			transcript = Transcript{}
+		}
+	} else {
+		log.Printf("[stream] %s segment %d: %s", utterance.UtteranceID, index, droppedReason)
 	}
 	sizeBytes := int64(len(wav))
 	durationMs, err := wavDurationMs(wav)
@@ -286,14 +361,19 @@ func (stream *audioStream) transcribeSegment(index int, wav []byte, startOffsetM
 	segment := Segment{UtteranceID: utterance.UtteranceID, Index: index, Text: spokenText(transcript.Text),
 		SpeechEndedAtClientMs: speechEndedAtMs - utterance.ClientClockSkewMs, SpeechEndedAtMs: speechEndedAtMs,
 		ClientClockSkewMs: utterance.ClientClockSkewMs, ReceivedAtMs: endpointedAtMs, Source: SegmentSourceStream,
-		AudioSizeBytes: &sizeBytes, AudioDurationMs: &durationMs, TranscriptionStartedAtMs: &startedAtMs, TranscribedAtMs: &transcribedAtMs,
+		AudioSizeBytes: &sizeBytes, AudioDurationMs: &durationMs, TranscriptionStartedAtMs: startedAtMs, TranscribedAtMs: transcribedAtMs,
 		TranscriptRaw: transcript.Text, DetectedSpeechStartOffsetMs: &startOffsetMs, DetectedSpeechEndOffsetMs: &endOffsetMs,
-		EndpointedAtMs: &endpointedAtMs, Transcriber: stream.options.TranscriberName}
+		EndpointedAtMs: &endpointedAtMs, Transcriber: stream.options.TranscriberName,
+		MeanSpeechProbability: &strength.MeanSpeechProbability, VoicedMs: &strength.VoicedMs, DroppedReason: droppedReason}
 	if _, err := d.store.InsertSegment(segment); err != nil {
 		stream.run.recordError(fmt.Sprintf("segment %d: store: %v", index, err))
 		return
 	}
-	stream.run.hub.publish(eventTranscript, map[string]any{"index": index, "text": segment.Text})
+	transcriptEvent := map[string]any{"index": index, "text": segment.Text}
+	if droppedReason != "" {
+		transcriptEvent["dropped_reason"] = droppedReason
+	}
+	stream.run.hub.publish(eventTranscript, transcriptEvent)
 	if err := d.SegmentArrived(utterance, segment); err != nil {
 		stream.run.recordError(fmt.Sprintf("segment %d: %v", index, err))
 	}

@@ -84,6 +84,11 @@ var columnsAddedAfterTheFirstSchema = []struct{ table, column, definition string
 	{"utterances", "target_kind", "TEXT NOT NULL DEFAULT 'pool'"},
 	{"utterances", "target_session_id", "TEXT NOT NULL DEFAULT ''"},
 	{"utterances", "target_signal_id", "TEXT NOT NULL DEFAULT ''"},
+	{"segments", "mean_speech_probability", "REAL"},
+	{"segments", "voiced_ms", "INTEGER"},
+	{"segments", "dropped_reason", "TEXT NOT NULL DEFAULT ''"},
+	{"replay_configurations", "high_pass_cutoff_hz", "INTEGER NOT NULL DEFAULT 0"},
+	{"replay_configurations", "minimum_segment_mean_speech_probability", "REAL NOT NULL DEFAULT 0"},
 }
 
 func addMissingColumns(db *sql.DB) error {
@@ -199,6 +204,11 @@ type Segment struct {
 	DetectedSpeechEndOffsetMs   *int64 `json:"detected_speech_end_offset_ms,omitempty"`
 	EndpointedAtMs              *int64 `json:"endpointed_at_ms,omitempty"`
 	Transcriber                 string `json:"transcriber,omitempty"`
+	// For SegmentSourceStream: how surely the detector heard speech, and,
+	// when that was too weak to transcribe, why the segment holds no words.
+	MeanSpeechProbability *float64 `json:"mean_speech_probability,omitempty"`
+	VoicedMs              *int64   `json:"voiced_ms,omitempty"`
+	DroppedReason         string   `json:"dropped_reason,omitempty"`
 }
 
 // Where a segment's text came from.
@@ -414,11 +424,12 @@ func (s *Store) InsertSegment(segment Segment) (bool, error) {
 	}
 	result, err := s.db.Exec(`INSERT INTO segments (utterance_id, segment_index, text, speech_ended_at_client_ms, speech_ended_at_ms, client_clock_skew_ms, received_at_ms,
 		source, audio_size_bytes, audio_duration_ms, transcription_started_at_ms, transcribed_at_ms, transcript_raw,
-		detected_speech_start_offset_ms, detected_speech_end_offset_ms, endpointed_at_ms, transcriber)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (utterance_id, segment_index) DO NOTHING`,
+		detected_speech_start_offset_ms, detected_speech_end_offset_ms, endpointed_at_ms, transcriber, mean_speech_probability, voiced_ms, dropped_reason)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (utterance_id, segment_index) DO NOTHING`,
 		segment.UtteranceID, segment.Index, segment.Text, segment.SpeechEndedAtClientMs, segment.SpeechEndedAtMs, segment.ClientClockSkewMs, segment.ReceivedAtMs,
 		segment.Source, segment.AudioSizeBytes, segment.AudioDurationMs, segment.TranscriptionStartedAtMs, segment.TranscribedAtMs, segment.TranscriptRaw,
-		segment.DetectedSpeechStartOffsetMs, segment.DetectedSpeechEndOffsetMs, segment.EndpointedAtMs, segment.Transcriber)
+		segment.DetectedSpeechStartOffsetMs, segment.DetectedSpeechEndOffsetMs, segment.EndpointedAtMs, segment.Transcriber,
+		segment.MeanSpeechProbability, segment.VoicedMs, segment.DroppedReason)
 	if err != nil {
 		return false, err
 	}
@@ -430,7 +441,7 @@ func (s *Store) InsertSegment(segment Segment) (bool, error) {
 func (s *Store) Segments(utteranceID string) ([]Segment, error) {
 	rows, err := s.db.Query(`SELECT utterance_id, segment_index, text, speech_ended_at_client_ms, speech_ended_at_ms, client_clock_skew_ms, received_at_ms,
 		source, audio_size_bytes, audio_duration_ms, transcription_started_at_ms, transcribed_at_ms, transcript_raw,
-		detected_speech_start_offset_ms, detected_speech_end_offset_ms, endpointed_at_ms, transcriber
+		detected_speech_start_offset_ms, detected_speech_end_offset_ms, endpointed_at_ms, transcriber, mean_speech_probability, voiced_ms, dropped_reason
 		FROM segments WHERE utterance_id = ? ORDER BY segment_index`, utteranceID)
 	if err != nil {
 		return nil, err
@@ -442,7 +453,8 @@ func (s *Store) Segments(utteranceID string) ([]Segment, error) {
 		if err := rows.Scan(&segment.UtteranceID, &segment.Index, &segment.Text, &segment.SpeechEndedAtClientMs, &segment.SpeechEndedAtMs,
 			&segment.ClientClockSkewMs, &segment.ReceivedAtMs, &segment.Source, &segment.AudioSizeBytes, &segment.AudioDurationMs,
 			&segment.TranscriptionStartedAtMs, &segment.TranscribedAtMs, &segment.TranscriptRaw,
-			&segment.DetectedSpeechStartOffsetMs, &segment.DetectedSpeechEndOffsetMs, &segment.EndpointedAtMs, &segment.Transcriber); err != nil {
+			&segment.DetectedSpeechStartOffsetMs, &segment.DetectedSpeechEndOffsetMs, &segment.EndpointedAtMs, &segment.Transcriber,
+			&segment.MeanSpeechProbability, &segment.VoicedMs, &segment.DroppedReason); err != nil {
 			return nil, err
 		}
 		segment.TranscriptionMs = difference(segment.TranscriptionStartedAtMs, segment.TranscribedAtMs)

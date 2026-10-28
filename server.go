@@ -447,8 +447,13 @@ func (s *Server) postSegmentAudio(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), segmentTranscriptionLimit)
 	defer cancel()
+	heardWAV, err := highPassFilterWAV(wav, s.registry.Integer(SettingHighPassCutoffHertz))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	transcriptionStartedAtMs := s.now().UnixMilli()
-	transcript, err := transcriber.Transcribe(ctx, wav)
+	transcript, err := transcriber.Transcribe(ctx, heardWAV)
 	rawTranscript := transcript.Text
 	transcribedAtMs := s.now().UnixMilli()
 	if err != nil {

@@ -67,6 +67,12 @@ CREATE TABLE IF NOT EXISTS segments (
     detected_speech_end_offset_ms   INTEGER,
     endpointed_at_ms             INTEGER,
     transcriber                  TEXT NOT NULL DEFAULT '',
+    -- 'stream' segments: the detector's mean speech probability over the
+    -- segment, the audio it heard as surely speech, and why a segment too
+    -- weakly heard holds no words (it was neither transcribed nor sent).
+    mean_speech_probability      REAL,
+    voiced_ms                    INTEGER,
+    dropped_reason               TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (utterance_id, segment_index)
 );
 
@@ -173,7 +179,10 @@ CREATE TABLE IF NOT EXISTS replay_configurations (
     prompt_variant               TEXT NOT NULL DEFAULT '',
     warm_session                 INTEGER NOT NULL DEFAULT 0,
     max_budget_usd               REAL NOT NULL DEFAULT 0,
-    created_at_ms                INTEGER NOT NULL
+    created_at_ms                INTEGER NOT NULL,
+    -- 0: no high-pass filter, and every segment transcribed.
+    high_pass_cutoff_hz          INTEGER NOT NULL DEFAULT 0,
+    minimum_segment_mean_speech_probability REAL NOT NULL DEFAULT 0
 );
 
 -- One replay: a recording or a text run once under a configuration.
