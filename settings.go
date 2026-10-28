@@ -33,6 +33,7 @@ const (
 	SettingRaisedEffort            = "raised_effort"
 	SettingTranscribers            = "transcribers"
 	SettingSpeechDetectionURL      = "speech_detection_url"
+	SettingAppReleasePublishToken  = "app_release_publish_token"
 )
 
 // Keys of the settings the phone and the operator read and change through
@@ -89,6 +90,8 @@ func SettingDefinitions() []servicesettings.Definition {
 			Description: "Transcription services by name, as name:url pairs separated by commas, each url the inference route of a whisper.cpp whisper-server or of speech-server (which also returns word times), for example parakeet:http://127.0.0.1:<port>/inference. The transcriber setting picks the one live speech uses; a replay configuration names its own."},
 		{Key: SettingSpeechDetectionURL, EnvironmentVariable: "VOICE_INTAKE_SPEECH_DETECTION_URL", Kind: wiring, ValueType: text,
 			Description: "Where speech-server answers, for example http://127.0.0.1:<port>: streamed audio is scored there by its Silero voice activity detector. Empty: streaming utterances are refused with 503."},
+		{Key: SettingAppReleasePublishToken, EnvironmentVariable: "VOICE_INTAKE_APP_RELEASE_PUBLISH_TOKEN", Kind: secret, ValueType: text,
+			Description: "The token POST /admin/app/releases demands in X-Voice-Intake-Publish-Token, to publish a build of the phone app. Empty: publishing answers 503."},
 		{Key: SettingRaisedEffort, EnvironmentVariable: "VOICE_INTAKE_RAISED_EFFORT", Kind: behaviour, ValueType: text, Default: "high",
 			Description: "The effort a session runs at when its text contains one of effort_raising_phrases."},
 

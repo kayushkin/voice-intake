@@ -46,6 +46,10 @@ time with it. Both values are stored.
 | `POST /api/voice/replay-configurations`, `GET …` | a named way to run a replay, below |
 | `POST /api/voice/replays` | `{"configuration_id", "recording_id"}` or `{"configuration_id","text"}` → 202 the replay; it runs in the background |
 | `GET /api/voice/replays?configuration_id=…`, `GET /api/voice/replays/{replay_id}` | replays with their utterance, transcript, word accuracy, replies and timings |
+| `GET /api/voice/app/releases/latest` | the phone app's newest published build: `{"version_code","version_name","commit","sha256","size_bytes","published_at_ms"}`; none published → 404 (an addition: see *Contract changes*) |
+| `GET /api/voice/app/releases/{version_code}/apk` | that build's APK, `application/vnd.android.package-archive`, with `Range` support; unknown version → 404 |
+| `POST /admin/app/releases?version_code=…&version_name=…&commit=…` | loopback only, header `X-Voice-Intake-Publish-Token`; body the signed APK, `application/vnd.android.package-archive` → 201 the release row. A version code at or below any published one → 409; a body that is not a zip → 400; no token set → 503. Not under `/api/voice/`, so dash does not carry it |
+| `GET /admin/app/releases` | the same gate: every release, newest first |
 | `GET /health` | `{"status":"ok"}` |
 | `GET /settings` | every setting, where its value came from; secrets only as set or not |
 
@@ -185,7 +189,8 @@ The unit file sets only the listen address. Put the rest in a host-local
 drop-in, `~/.config/systemd/user/voice-intake.service.d/host.conf`, mode 600:
 an `EnvironmentFile=` holding `LLMBRIDGE_SERVICE_TOKEN`, the instance and
 working directory, `VOICE_INTAKE_TRANSCRIBERS`, `VOICE_INTAKE_TRANSCRIBER` and
-`VOICE_INTAKE_SPEECH_DETECTION_URL`. A whisper-server is run by the host, not
+`VOICE_INTAKE_SPEECH_DETECTION_URL`, and `VOICE_INTAKE_APP_RELEASE_PUBLISH_TOKEN`
+if this host publishes the phone app (*Phone app releases*). A whisper-server is run by the host, not
 by this repo.
 
 speech-server (`speech-server/`, its own Go module) links whisper.cpp's
@@ -208,6 +213,23 @@ session starts there.
 Sessions are created with type `interactive`, purpose `voice` and origin
 `voice-intake`. llm-bridge's purpose registry does not list `voice` yet, so
 the bridge stores it and logs a taxonomy notice on each create.
+
+## Phone app releases
+
+voice-intake serves the phone app's own updates. A build machine on this host
+publishes each signed APK with `POST /admin/app/releases`, which keeps the file
+in the data directory's `app-releases/`, computes its sha256 and keeps a row
+per release forever. The app asks `GET /api/voice/app/releases/latest` through
+dash, behind the same sign-in as every other phone route, downloads the APK,
+checks the hash and the signing certificate, and installs it. Nothing is
+public: the download needs the sign-in cookie, and publishing needs loopback
+and the publish token.
+
+```bash
+curl -fsS -X POST "http://127.0.0.1:8332/admin/app/releases?version_code=21&version_name=0.6.0&commit=$(git rev-parse --short HEAD)" \
+  -H "X-Voice-Intake-Publish-Token: $TOKEN" -H 'Content-Type: application/vnd.android.package-archive' \
+  --data-binary @mobile-release.apk
+```
 
 ## Build, test, deploy
 
@@ -236,4 +258,5 @@ which a client that ignores unknown fields and events has to handle:
 - A session in `GET /api/voice/utterances/{id}` carries `working_directory`, `reply_text` and `turn_cost_usd`.
 - Replay routes and `GET /api/voice/latency?group_by=configuration`, above. They are for measuring settings, not for the phone.
 - `POST /api/voice/utterances` takes an optional `target` (*Targets*, above): `pool` (the default and the behaviour before), `new_session`, `session` with `session_id`, or `signal` with `signal_id`; an unknown kind, a missing id or an id on the wrong kind is 400. Each utterance in `GET /api/voice/utterances/{id}` and the list carries `target` as stored, `{"kind":"pool"}` for one made without.
+- `GET /api/voice/app/releases/latest` and `GET /api/voice/app/releases/{version_code}/apk`: the phone app's updates (*Phone app releases*). The time field is `published_at_ms`, epoch milliseconds like every other time here.
 - `GET /api/voice/utterances/{id}` and the list carry more fields than the contract names: the phone's own timestamps beside the server-time ones, the clock skew, audio details, errors and the continuation judgments.

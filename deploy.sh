@@ -108,7 +108,9 @@ curl -sfS "$BASE/settings" >/dev/null || { echo "ERROR: /settings did not answer
 curl -sfS -H 'X-Principal-Id: deploy-smoke-check' "$BASE/api/voice/settings" >/dev/null || { echo "ERROR: /api/voice/settings did not answer"; exit 1; }
 code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/voice/settings")"
 [ "$code" = "401" ] || { echo "ERROR: /api/voice/settings without X-Principal-Id answered $code, want 401"; exit 1; }
-echo "    /health, /settings and /api/voice/settings answered, and the principal gate refused a bare call"
+code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/admin/app/releases")"
+[ "$code" = "401" ] || { echo "ERROR: /admin/app/releases without the publish token answered $code, want 401"; exit 1; }
+echo "    /health, /settings and /api/voice/settings answered, and the principal and publish gates refused bare calls"
 
 # The bind is part of the contract: the service trusts X-Principal-Id from
 # loopback and must not be reachable off-host. Fail the deploy if it is listening anywhere else.

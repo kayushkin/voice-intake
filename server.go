@@ -46,6 +46,10 @@ type Server struct {
 	// settingValidators check a new value with the service that owns what
 	// it names.
 	settingValidators map[string]func(ctx context.Context, value string) error
+	// appReleaseDirectory holds the published APKs of the phone app.
+	appReleaseDirectory string
+	// appReleasePublishToken is what the admin route demands to publish one.
+	appReleasePublishToken string
 }
 
 // NewServer builds the API.
@@ -83,7 +87,13 @@ func (s *Server) Handler() http.Handler {
 	voice.HandleFunc("POST /api/voice/replays", s.createReplay)
 	voice.HandleFunc("GET /api/voice/replays", s.listReplays)
 	voice.HandleFunc("GET /api/voice/replays/{replay_id}", s.getReplay)
+	voice.HandleFunc("GET /api/voice/app/releases/latest", s.latestAppRelease)
+	voice.HandleFunc("GET /api/voice/app/releases/{version_code}/apk", s.downloadAppRelease)
 	mux.Handle("/api/voice/", requirePrincipalFromLoopback(voice))
+	// Not under /api/voice/, so dash does not carry it: a build machine on
+	// this host publishes the phone app's releases here.
+	mux.HandleFunc("POST /admin/app/releases", s.requirePublishTokenFromLoopback(s.publishAppRelease))
+	mux.HandleFunc("GET /admin/app/releases", s.requirePublishTokenFromLoopback(s.listAppReleases))
 	return mux
 }
 

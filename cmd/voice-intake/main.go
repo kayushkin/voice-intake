@@ -54,6 +54,8 @@ func main() {
 	dispatcher.SetSpeechServices(detector, transcribers)
 	dispatcher.SetReplayRecordingDirectory(filepath.Join(dataDirectory, "replay-recordings"))
 	server := voiceintake.NewServer(store, dispatcher, pool, registry, transcribers, time.Now)
+	server.SetAppReleaseDirectory(filepath.Join(dataDirectory, "app-releases"))
+	server.SetAppReleasePublishToken(registry.String(voiceintake.SettingAppReleasePublishToken))
 
 	modelStoreURL := strings.TrimRight(registry.String(voiceintake.SettingModelStoreURL), "/")
 	server.SetSettingValidator(voiceintake.SettingContinuationJudgeModelRole, func(ctx context.Context, role string) error {

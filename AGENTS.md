@@ -30,7 +30,7 @@ Every time column is server epoch milliseconds. A phone timestamp is stored as s
 
 ## Who may call it
 
-Every `/api/voice/` route takes requests only from loopback and needs `X-Principal-Id` (403 off loopback, 401 without it; `requirePrincipalFromLoopback`). dash is the front door: it proxies `/api/voice/` unchanged and sets `X-Principal-Id` from the signed-in caller after deleting any the browser sent. An utterance of another principal is 404. `GET /health` and `GET /settings` are open on loopback. This service calls llm-bridge-server with its service token (`LLMBRIDGE_SERVICE_TOKEN`) and, when creating a session, `X-Principal-Id` naming the person; it calls model-store only to check a new judge role or default model.
+Every `/api/voice/` route takes requests only from loopback and needs `X-Principal-Id` (403 off loopback, 401 without it; `requirePrincipalFromLoopback`). dash is the front door: it proxies `/api/voice/` unchanged and sets `X-Principal-Id` from the signed-in caller after deleting any the browser sent. An utterance of another principal is 404. `GET /health` and `GET /settings` are open on loopback. `/admin/app/releases` (publish and list the phone app's builds, `app_releases.go`) takes loopback plus `X-Voice-Intake-Publish-Token` matching `VOICE_INTAKE_APP_RELEASE_PUBLISH_TOKEN` (host drop-in; the token's copy for publishers is in auth-store); dash does not proxy `/admin/`. The APKs lie in `app-releases/` in the data directory. This service calls llm-bridge-server with its service token (`LLMBRIDGE_SERVICE_TOKEN`) and, when creating a session, `X-Principal-Id` naming the person; it calls model-store only to check a new judge role or default model.
 
 ## Unit, settings and deploy
 

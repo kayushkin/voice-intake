@@ -193,3 +193,15 @@ CREATE TABLE IF NOT EXISTS replays (
     oneshot_text                 TEXT NOT NULL DEFAULT '',
     error                        TEXT NOT NULL DEFAULT ''
 );
+
+-- The phone app's published builds, one row per version code, kept forever.
+-- The APK lies in the data directory's app-releases/ under filename.
+CREATE TABLE IF NOT EXISTS app_releases (
+    version_code     INTEGER PRIMARY KEY,
+    version_name     TEXT NOT NULL,
+    commit_sha       TEXT NOT NULL,
+    sha256           TEXT NOT NULL,
+    size_bytes       INTEGER NOT NULL,
+    filename         TEXT NOT NULL,
+    published_at_ms  INTEGER NOT NULL
+);
