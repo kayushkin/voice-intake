@@ -16,12 +16,12 @@ func (h *harness) createTargetedUtterance(clientID string, target map[string]any
 		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli() - 3000, "target": target, "confirm_before_send": false}, testPrincipal)
 }
 
-// createHeldUtterance makes an utterance with the default for its target,
-// which for session, signal and new_session is to hold the words.
+// createHeldUtterance makes an utterance that asks for its words to be held
+// until the person confirms them, as an app with a confirm screen does.
 func (h *harness) createHeldUtterance(clientID string, target map[string]any) string {
 	h.t.Helper()
 	status, answer := h.call("POST", "/api/voice/utterances", map[string]any{"client_utterance_id": clientID, "mode": "quick", "strategy": "endpoint",
-		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli() - 3000, "target": target}, testPrincipal)
+		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli() - 3000, "target": target, "confirm_before_send": true}, testPrincipal)
 	if status != http.StatusCreated {
 		h.t.Fatalf("create = %d %v", status, answer)
 	}

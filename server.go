@@ -169,8 +169,10 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 		AudioFormat       string `json:"audio_format"`
 		// Target is optional; left out, the words go to the pool.
 		Target *UtteranceTarget `json:"target"`
-		// ConfirmBeforeSend is optional: left out, targets session, signal
-		// and new_session hold their words for the person to confirm.
+		// ConfirmBeforeSend is optional and off when left out. A client that
+		// can show the words and send a confirm asks for it; a client that
+		// cannot would leave the words held until they expire, as app 0.6.2
+		// did with utterance_000341.
 		ConfirmBeforeSend *bool `json:"confirm_before_send"`
 	}
 	if err := decodeStrict(r, &body); err != nil {
@@ -206,7 +208,7 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 			problems = append(problems, err.Error())
 		}
 	}
-	confirmBeforeSend := target.heldForConfirmation()
+	confirmBeforeSend := false
 	if body.ConfirmBeforeSend != nil {
 		if *body.ConfirmBeforeSend && !target.heldForConfirmation() {
 			problems = append(problems, fmt.Sprintf("confirm_before_send is for targets %s, %s and %s; the pool's quick questions are sent at once",

@@ -136,7 +136,7 @@ func TestAStreamedReplyIsHeldAndThePoolIsNever(t *testing.T) {
 	h.bridge.ownSession("br_mine", testPrincipal)
 	status, answer := h.call("POST", "/api/voice/utterances", map[string]any{"client_utterance_id": "stream-held", "mode": "quick", "strategy": "endpoint",
 		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli(), "audio_streaming": true, "audio_format": StreamAudioFormat,
-		"target": map[string]any{"kind": "session", "session_id": "br_mine"}}, testPrincipal)
+		"target": map[string]any{"kind": "session", "session_id": "br_mine"}, "confirm_before_send": true}, testPrincipal)
 	if status != http.StatusCreated {
 		t.Fatalf("create = %d %v", status, answer)
 	}
@@ -158,5 +158,27 @@ func TestAStreamedReplyIsHeldAndThePoolIsNever(t *testing.T) {
 	if status, _ := h.call("POST", "/api/voice/utterances", map[string]any{"client_utterance_id": "pool-held", "mode": "quick", "strategy": "endpoint",
 		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli(), "confirm_before_send": true}, testPrincipal); status != http.StatusBadRequest {
 		t.Fatalf("confirm_before_send on the pool = %d, want 400", status)
+	}
+}
+
+// A client that does not ask for the hold, such as an app version with no
+// confirm screen, gets its words sent at once rather than held until they
+// expire unsent.
+func TestASessionTargetIsSentAtOnceWhenTheClientDoesNotAskForTheHold(t *testing.T) {
+	h := newHarness(t, nil)
+	h.bridge.ownSession("br_mine", testPrincipal)
+	status, answer := h.call("POST", "/api/voice/utterances", map[string]any{"client_utterance_id": "old-client", "mode": "quick", "strategy": "endpoint",
+		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli() - 3000,
+		"target": map[string]any{"kind": "session", "session_id": "br_mine"}}, testPrincipal)
+	if status != http.StatusCreated {
+		t.Fatalf("create = %d %v", status, answer)
+	}
+	utteranceID := answer["utterance_id"].(string)
+	h.postSegment(utteranceID, 0, "carry on with the caching work", time.Now().UnixMilli()-500)
+	h.finish(utteranceID)
+	h.followUntilDone(utteranceID)
+	h.bridge.snapshot()
+	if got := h.bridge.personSent["br_mine"]; len(got) != 1 || got[0] != "carry on with the caching work" {
+		t.Fatalf("sent to the person's session = %v, want the words once", got)
 	}
 }
