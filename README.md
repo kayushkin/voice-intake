@@ -32,7 +32,8 @@ time with it. Both values are stored.
 | `POST /api/voice/utterances/{id}/segments` | `{"index","text","speech_ended_at_ms"}` → 202 and dispatch; an index already received → 200, ignored; after cancel → 409 |
 | `POST /api/voice/utterances/{id}/segments/{index}/audio?speech_ended_at_ms=…` | body the segment's sound, `audio/wav`, 16 kHz mono 16-bit PCM; transcribed, then handled as a text segment with that index → 202 `{"text","transcription_ms","audio_duration_ms","status":"accepted"}`; no words → 200 `"status":"no words"`, stored, not dispatched; an index already received → 200, not transcribed; after cancel → 409; transcription failed → 502, nothing stored; no transcription service set → 503 (an addition: see *Contract changes*) |
 | `POST /api/voice/utterances/{id}/finish` | `{"ended_at_ms"}` → 200; decisions become final once every received segment is handled |
-| `POST /api/voice/utterances/{id}/cancel` | → 200; stops every session the utterance started |
+| `POST /api/voice/utterances/{id}/cancel` | → 200; stops every session the utterance started, and discards words held for confirmation |
+| `POST /api/voice/utterances/{id}/confirm` | optional `{"text"}`, which must be the words held → 200 `{"utterance_id","status":"confirmed"}` and the words are sent; nothing held, or already confirmed, cancelled or expired → 409; other words → 409 (an addition: see *Confirmation*) |
 | `POST /api/voice/utterances/{id}/audio?filename=…` | body the bytes, `audio/wav`, `audio/ogg` or `audio/flac` → 200 `{"shared_into":[…]}`; kept in the data directory and shared into every session the utterance still keeps, and into any it starts later |
 | `GET /api/voice/utterances/{id}` | the row: segments, sessions with roles and timings, decisions, continuation judgments |
 | `GET /api/voice/utterances?limit=50` | the caller's utterances, newest first |
@@ -65,6 +66,7 @@ quiet stream; the answer carries `X-Accel-Buffering: no`.
 - `event: session_event` `{"session_id","event":<the llm-bridge-server event, unchanged>}`, for sessions not superseded. The reply is the `result` event's text.
 - `event: error` `{"message"}`, when a session could not be started, sent to or stopped (an addition: see *Contract changes*)
 - `event: done` `{}`
+- `event: awaiting_confirmation` `{"text","expires_at_ms"}` when the words are held for the person to confirm, and `event: confirmation_ended` `{"state":"confirmed|cancelled|expired"}` when that ends (additions: see *Confirmation*)
 - Streaming utterances also get `event: hearing` `{"speech"}` when the detector starts or stops hearing speech, `event: transcript` `{"index","text"}` once a segment is transcribed, and `event: stop_recording` `{"reason":"continuation_window_closed|max_duration|no_speech"}`, sent once.
 
 ## Streaming: the server ends the segments
@@ -102,7 +104,24 @@ out is the same as `{"kind":"pool"}`.
 - `{"kind":"session","session_id":"br_…"}`: the words go as the next message of a session the person already has. The bridge is asked, as the person, at create (404 if the session is missing or not theirs) and again by the send itself.
 - `{"kind":"signal","signal_id":"sig_…"}`: the words answer an open question through llm-bridge-server's `POST /signals/{id}/answer`. The bridge resolves the questions of one call or turn only all at once, so every open question that shares the signal's session and request id gets the same words. A notification is 409 at create, and a question already answered or dismissed is 404, since only open signals are read.
 
-For `session` and `signal` nothing is split or judged: the segments are kept, in order, and sent joined as **one message when the utterance finishes** (after `finish`, or once a streamed utterance's `stop` has every segment transcribed). Streaming still ends segments at pauses, so `stop_recording` still comes when the continuation window closes. The reply streams on `/events` as `session_event`, with one `dispatch` and one `decision` (`kept`) for the person's session. When the bridge is first asked for an existing session's events it sends that session's last turn again; those events, and the user message itself, are not passed on, so the first `result` the phone sees is the reply to these words (when the answer goes to a tool call still parked in a running turn, that turn's events are passed on at once). The person's session is never stopped or archived from here, not even by `cancel`, and the recording is not shared into it. A message sent while the session is still mid-turn may be followed first by that turn's own result.
+For `session` and `signal` nothing is split or judged: the segments are kept, in order, and sent joined as **one message when the utterance finishes** (once confirmed, by default: *Confirmation*) (after `finish`, or once a streamed utterance's `stop` has every segment transcribed). Streaming still ends segments at pauses, so `stop_recording` still comes when the continuation window closes. The reply streams on `/events` as `session_event`, with one `dispatch` and one `decision` (`kept`) for the person's session. When the bridge is first asked for an existing session's events it sends that session's last turn again; those events, and the user message itself, are not passed on, so the first `result` the phone sees is the reply to these words (when the answer goes to a tool call still parked in a running turn, that turn's events are passed on at once). The person's session is never stopped or archived from here, not even by `cancel`, and the recording is not shared into it. A message sent while the session is still mid-turn may be followed first by that turn's own result.
+
+## Confirmation: nothing goes to a session or a question unchecked
+
+For targets `session`, `signal` and `new_session` the words are **held** by
+default: at finish (for a streamed utterance, once `stop` has every segment
+transcribed) the segments are joined, stored as `confirmation_text`, and sent
+to the phone as `event: awaiting_confirmation` `{"text","expires_at_ms"}`.
+Nothing is sent until `POST …/confirm`; then they go as described above, and
+`new_session` starts one chat session for the joined words (nothing split or
+judged). `POST …/cancel` discards them. Held words nobody confirms expire
+after two minutes, recorded as `expired` and never sent. Each ending sends
+`event: confirmation_ended` `{"state"}`, and the decisions become final then,
+so `done` comes after it. `"confirm_before_send": false` on create sends at
+finish as before; `true` on the pool is 400, since quick questions are sent at
+once. Confirm, cancel and expiry race safely: the first to change
+`confirmation_state` from `awaiting` wins, and a later confirm is 409. Held
+words survive a restart of this service, with their own expiry.
 
 ## The pool
 
@@ -261,5 +280,6 @@ which a client that ignores unknown fields and events has to handle:
 - A session in `GET /api/voice/utterances/{id}` carries `working_directory`, `reply_text` and `turn_cost_usd`.
 - Replay routes and `GET /api/voice/latency?group_by=configuration`, above. They are for measuring settings, not for the phone.
 - `POST /api/voice/utterances` takes an optional `target` (*Targets*, above): `pool` (the default and the behaviour before), `new_session`, `session` with `session_id`, or `signal` with `signal_id`; an unknown kind, a missing id or an id on the wrong kind is 400. Each utterance in `GET /api/voice/utterances/{id}` and the list carries `target` as stored, `{"kind":"pool"}` for one made without.
+- Confirmation (*Confirmation*, above): `POST /api/voice/utterances` takes an optional `confirm_before_send` (true by default for targets `session`, `signal` and `new_session`; `true` on the pool is 400). The new route `POST /api/voice/utterances/{id}/confirm`, the events `awaiting_confirmation` and `confirmation_ended`, and on each utterance `confirm_before_send`, `confirmation_state` (empty, `awaiting`, `confirmed`, `cancelled` or `expired`), `confirmation_text`, `confirmation_expires_at_ms` and `confirmation_resolved_at_ms`. **This changes behaviour for a client that ignores it:** such a client's session, signal and new_session utterances are held and expire unsent unless it sends `"confirm_before_send": false`.
 - `GET /api/voice/app/releases/latest` and `GET /api/voice/app/releases/{version_code}/apk`: the phone app's updates (*Phone app releases*). The time field is `published_at_ms`, epoch milliseconds like every other time here.
 - `GET /api/voice/utterances/{id}` and the list carry more fields than the contract names: the phone's own timestamps beside the server-time ones, the clock skew, audio details, errors and the continuation judgments.

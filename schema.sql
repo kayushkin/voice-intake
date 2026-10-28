@@ -42,6 +42,15 @@ CREATE TABLE IF NOT EXISTS utterances (
     target_kind                  TEXT NOT NULL DEFAULT 'pool',
     target_session_id            TEXT NOT NULL DEFAULT '',
     target_signal_id             TEXT NOT NULL DEFAULT '',
+    -- Targets session, signal and new_session hold the joined words until
+    -- the person confirms them. confirmation_state: '' (nothing held yet),
+    -- 'awaiting', then 'confirmed' (sent), 'cancelled' or 'expired' (never
+    -- sent).
+    confirm_before_send          INTEGER NOT NULL DEFAULT 0,
+    confirmation_state           TEXT NOT NULL DEFAULT '',
+    confirmation_text            TEXT NOT NULL DEFAULT '',
+    confirmation_expires_at_ms   INTEGER,
+    confirmation_resolved_at_ms  INTEGER,
     UNIQUE (principal_id, client_utterance_id)
 );
 

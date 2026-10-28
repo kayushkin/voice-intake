@@ -374,6 +374,13 @@ type receivedEvent struct {
 // followUntilDone reads the utterance's event stream until done.
 func (h *harness) followUntilDone(utteranceID string) []receivedEvent {
 	h.t.Helper()
+	return h.followUntil(utteranceID, eventDone)
+}
+
+// followUntil reads the utterance's event stream, from the start, until the
+// first event named last.
+func (h *harness) followUntil(utteranceID, last string) []receivedEvent {
+	h.t.Helper()
 	request, _ := http.NewRequest("GET", h.server.URL+"/api/voice/utterances/"+utteranceID+"/events", nil)
 	request.Header.Set("X-Principal-Id", testPrincipal)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -400,12 +407,12 @@ func (h *harness) followUntilDone(utteranceID string) []receivedEvent {
 				h.t.Fatalf("event %s data: %v", name, err)
 			}
 			events = append(events, receivedEvent{name: name, data: data})
-			if name == eventDone {
+			if name == last {
 				return events
 			}
 		}
 	}
-	h.t.Fatalf("the event stream ended without done; got %v (err %v)", events, scanner.Err())
+	h.t.Fatalf("the event stream ended without %s; got %v (err %v)", last, events, scanner.Err())
 	return nil
 }
 

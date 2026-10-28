@@ -84,6 +84,11 @@ var columnsAddedAfterTheFirstSchema = []struct{ table, column, definition string
 	{"utterances", "target_kind", "TEXT NOT NULL DEFAULT 'pool'"},
 	{"utterances", "target_session_id", "TEXT NOT NULL DEFAULT ''"},
 	{"utterances", "target_signal_id", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "confirm_before_send", "INTEGER NOT NULL DEFAULT 0"},
+	{"utterances", "confirmation_state", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "confirmation_text", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "confirmation_expires_at_ms", "INTEGER"},
+	{"utterances", "confirmation_resolved_at_ms", "INTEGER"},
 	{"segments", "mean_speech_probability", "REAL"},
 	{"segments", "voiced_ms", "INTEGER"},
 	{"segments", "dropped_reason", "TEXT NOT NULL DEFAULT ''"},
@@ -174,7 +179,24 @@ type Utterance struct {
 	ReplayID                string   `json:"replay_id"`
 	// Target is where the words go; kind pool when the phone named none.
 	Target UtteranceTarget `json:"target"`
+	// ConfirmBeforeSend holds the joined words for the person to confirm
+	// before anything is sent (targets session, signal and new_session).
+	// ConfirmationState is empty until words are held, then awaiting, and
+	// at last confirmed, cancelled or expired.
+	ConfirmBeforeSend        bool   `json:"confirm_before_send"`
+	ConfirmationState        string `json:"confirmation_state"`
+	ConfirmationText         string `json:"confirmation_text"`
+	ConfirmationExpiresAtMs  *int64 `json:"confirmation_expires_at_ms"`
+	ConfirmationResolvedAtMs *int64 `json:"confirmation_resolved_at_ms"`
 }
+
+// Confirmation states of an utterance whose words are held.
+const (
+	ConfirmationAwaiting  = "awaiting"
+	ConfirmationConfirmed = "confirmed"
+	ConfirmationCancelled = "cancelled"
+	ConfirmationExpired   = "expired"
+)
 
 // Segment is speech between two pauses.
 type Segment struct {
@@ -281,7 +303,8 @@ const utteranceColumns = `utterance_id, client_utterance_id, principal_id, mode,
 	audio_filename, audio_content_type, audio_size_bytes, audio_received_at_ms, errors,
 	audio_streaming, audio_format, stream_received_bytes, stop_recording_reason, stop_recording_sent_at_ms,
 	stopped_at_client_ms, stopped_at_ms, stop_reason, replay_id,
-	target_kind, target_session_id, target_signal_id`
+	target_kind, target_session_id, target_signal_id,
+	confirm_before_send, confirmation_state, confirmation_text, confirmation_expires_at_ms, confirmation_resolved_at_ms`
 
 type rowScanner interface {
 	Scan(destination ...any) error
@@ -297,7 +320,8 @@ func scanUtterance(row rowScanner) (Utterance, error) {
 		&utterance.AudioFilename, &utterance.AudioContentType, &utterance.AudioSizeBytes, &utterance.AudioReceivedAtMs, &errorsJSON,
 		&utterance.AudioStreaming, &utterance.AudioFormat, &utterance.StreamReceivedBytes, &utterance.StopRecordingReason, &utterance.StopRecordingSentAtMs,
 		&utterance.StoppedAtClientMs, &utterance.StoppedAtMs, &utterance.StopReason, &utterance.ReplayID,
-		&utterance.Target.Kind, &utterance.Target.SessionID, &utterance.Target.SignalID)
+		&utterance.Target.Kind, &utterance.Target.SessionID, &utterance.Target.SignalID,
+		&utterance.ConfirmBeforeSend, &utterance.ConfirmationState, &utterance.ConfirmationText, &utterance.ConfirmationExpiresAtMs, &utterance.ConfirmationResolvedAtMs)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Utterance{}, ErrNotFound
 	}
@@ -337,15 +361,34 @@ func (s *Store) CreateUtterance(utterance Utterance) (Utterance, bool, error) {
 	}
 	_, err = transaction.Exec(`INSERT INTO utterances (sequence, utterance_id, client_utterance_id, principal_id, mode, strategy, trigger,
 		speech_started_at_client_ms, speech_started_at_ms, client_clock_skew_ms, received_at_ms, audio_streaming, audio_format, replay_id,
-		target_kind, target_session_id, target_signal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		target_kind, target_session_id, target_signal_id, confirm_before_send) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		next, utterance.UtteranceID, utterance.ClientUtteranceID, utterance.PrincipalID, utterance.Mode, utterance.Strategy, utterance.Trigger,
 		utterance.SpeechStartedAtClientMs, utterance.SpeechStartedAtMs, utterance.ClientClockSkewMs, utterance.ReceivedAtMs,
 		utterance.AudioStreaming, utterance.AudioFormat, utterance.ReplayID,
-		utterance.Target.Kind, utterance.Target.SessionID, utterance.Target.SignalID)
+		utterance.Target.Kind, utterance.Target.SessionID, utterance.Target.SignalID, utterance.ConfirmBeforeSend)
 	if err != nil {
 		return Utterance{}, false, err
 	}
 	return utterance, true, transaction.Commit()
+}
+
+// HoldForConfirmation records the words held for the person to confirm.
+func (s *Store) HoldForConfirmation(utteranceID, text string, expiresAtMs int64) error {
+	return s.exec(`UPDATE utterances SET confirmation_state = ?, confirmation_text = ?, confirmation_expires_at_ms = ? WHERE utterance_id = ?`,
+		ConfirmationAwaiting, text, expiresAtMs, utteranceID)
+}
+
+// ResolveConfirmation moves held words from awaiting to state, and reports
+// whether this call did it: confirm, cancel and expiry race, and only the
+// first wins.
+func (s *Store) ResolveConfirmation(utteranceID, state string, atMs int64) (bool, error) {
+	result, err := s.db.Exec(`UPDATE utterances SET confirmation_state = ?, confirmation_resolved_at_ms = ? WHERE utterance_id = ? AND confirmation_state = ?`,
+		state, atMs, utteranceID, ConfirmationAwaiting)
+	if err != nil {
+		return false, err
+	}
+	affected, err := result.RowsAffected()
+	return affected == 1, err
 }
 
 // GetUtterance reads one utterance.

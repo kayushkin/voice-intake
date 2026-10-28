@@ -23,6 +23,9 @@ const (
 	eventHearing       = "hearing"
 	eventTranscript    = "transcript"
 	eventStopRecording = "stop_recording"
+	// Held words: the person confirms them, or they are never sent.
+	eventAwaitingConfirmation = "awaiting_confirmation"
+	eventConfirmationEnded    = "confirmation_ended"
 )
 
 // eventHub keeps every event of one utterance, so a subscriber that connects

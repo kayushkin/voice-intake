@@ -73,6 +73,7 @@ func (s *Server) Handler() http.Handler {
 	voice.HandleFunc("POST /api/voice/utterances/{id}/segments/{index}/audio", s.postSegmentAudio)
 	voice.HandleFunc("POST /api/voice/utterances/{id}/finish", s.finishUtterance)
 	voice.HandleFunc("POST /api/voice/utterances/{id}/cancel", s.cancelUtterance)
+	voice.HandleFunc("POST /api/voice/utterances/{id}/confirm", s.confirmUtterance)
 	voice.HandleFunc("POST /api/voice/utterances/{id}/audio", s.postAudio)
 	voice.HandleFunc("GET /api/voice/utterances/{id}/events", s.followUtterance)
 	voice.HandleFunc("GET /api/voice/settings", s.getVoiceSettings)
@@ -168,6 +169,9 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 		AudioFormat       string `json:"audio_format"`
 		// Target is optional; left out, the words go to the pool.
 		Target *UtteranceTarget `json:"target"`
+		// ConfirmBeforeSend is optional: left out, targets session, signal
+		// and new_session hold their words for the person to confirm.
+		ConfirmBeforeSend *bool `json:"confirm_before_send"`
 	}
 	if err := decodeStrict(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -202,6 +206,14 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 			problems = append(problems, err.Error())
 		}
 	}
+	confirmBeforeSend := target.heldForConfirmation()
+	if body.ConfirmBeforeSend != nil {
+		if *body.ConfirmBeforeSend && !target.heldForConfirmation() {
+			problems = append(problems, fmt.Sprintf("confirm_before_send is for targets %s, %s and %s; the pool's quick questions are sent at once",
+				TargetSession, TargetSignal, TargetNewSession))
+		}
+		confirmBeforeSend = *body.ConfirmBeforeSend
+	}
 	skew, err := s.clientClockSkewMs(r, receivedAtMs)
 	if err != nil {
 		problems = append(problems, err.Error())
@@ -223,7 +235,7 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 	utterance, created, err := s.store.CreateUtterance(Utterance{
 		ClientUtteranceID: body.ClientUtteranceID, PrincipalID: principalOf(r), Mode: body.Mode, Strategy: body.Strategy, Trigger: body.Trigger,
 		SpeechStartedAtClientMs: *body.SpeechStartedAtMs, SpeechStartedAtMs: *body.SpeechStartedAtMs + skew, ClientClockSkewMs: skew, ReceivedAtMs: receivedAtMs,
-		AudioStreaming: body.AudioStreaming, AudioFormat: body.AudioFormat, Target: target,
+		AudioStreaming: body.AudioStreaming, AudioFormat: body.AudioFormat, Target: target, ConfirmBeforeSend: confirmBeforeSend,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -624,6 +636,41 @@ func (s *Server) cancelUtterance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"utterance_id": utterance.UtteranceID, "status": "cancelled"})
+}
+
+// confirmUtterance sends the words held for confirmation. The body is
+// optional: {"text"} must then be the words held.
+func (s *Server) confirmUtterance(w http.ResponseWriter, r *http.Request) {
+	utterance, ok := s.ownedUtterance(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Text *string `json:"text"`
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(string(raw)) != "" {
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&body); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid body: %v", err))
+			return
+		}
+	}
+	err = s.dispatcher.ConfirmHeldWords(utterance, body.Text)
+	switch {
+	case errors.Is(err, ErrNothingAwaitingConfirmation), errors.Is(err, ErrConfirmationTextDiffers):
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"utterance_id": utterance.UtteranceID, "status": "confirmed"})
 }
 
 func (s *Server) postAudio(w http.ResponseWriter, r *http.Request) {

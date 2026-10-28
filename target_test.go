@@ -8,10 +8,24 @@ import (
 	"time"
 )
 
+// createTargetedUtterance makes an utterance that sends at finish, without
+// waiting for confirmation: the path these tests check.
 func (h *harness) createTargetedUtterance(clientID string, target map[string]any) (int, map[string]any) {
 	h.t.Helper()
 	return h.call("POST", "/api/voice/utterances", map[string]any{"client_utterance_id": clientID, "mode": "quick", "strategy": "endpoint",
+		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli() - 3000, "target": target, "confirm_before_send": false}, testPrincipal)
+}
+
+// createHeldUtterance makes an utterance with the default for its target,
+// which for session, signal and new_session is to hold the words.
+func (h *harness) createHeldUtterance(clientID string, target map[string]any) string {
+	h.t.Helper()
+	status, answer := h.call("POST", "/api/voice/utterances", map[string]any{"client_utterance_id": clientID, "mode": "quick", "strategy": "endpoint",
 		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli() - 3000, "target": target}, testPrincipal)
+	if status != http.StatusCreated {
+		h.t.Fatalf("create = %d %v", status, answer)
+	}
+	return answer["utterance_id"].(string)
 }
 
 func (h *harness) finish(utteranceID string) {
@@ -208,7 +222,7 @@ func TestAStreamedReplyToASessionIsOneMessageAcrossPauses(t *testing.T) {
 	h.bridge.ownSession("br_mine", testPrincipal)
 	status, answer := h.call("POST", "/api/voice/utterances", map[string]any{"client_utterance_id": "stream-reply", "mode": "quick", "strategy": "endpoint",
 		"trigger": "widget", "speech_started_at_ms": time.Now().UnixMilli(), "audio_streaming": true, "audio_format": StreamAudioFormat,
-		"target": map[string]any{"kind": "session", "session_id": "br_mine"}}, testPrincipal)
+		"target": map[string]any{"kind": "session", "session_id": "br_mine"}, "confirm_before_send": false}, testPrincipal)
 	if status != http.StatusCreated {
 		t.Fatalf("create = %d %v", status, answer)
 	}

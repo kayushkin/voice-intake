@@ -65,6 +65,12 @@ func (target UtteranceTarget) deliversOneMessage() bool {
 	return target.Kind == TargetSession || target.Kind == TargetSignal
 }
 
+// heldForConfirmation reports whether the target can hold its words for the
+// person to confirm. The pool cannot: quick questions stay instant.
+func (target UtteranceTarget) heldForConfirmation() bool {
+	return target.Kind == TargetSession || target.Kind == TargetSignal || target.Kind == TargetNewSession
+}
+
 // Errors a bridge returns about a target.
 var (
 	// ErrTargetNotFound is a session or signal the bridge does not have, or

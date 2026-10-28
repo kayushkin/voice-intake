@@ -25,6 +25,16 @@ const sessionTurnLimit = 5 * time.Minute
 // subscriber, so sending first loses no event; waiting only keeps it simple.
 const streamOpenWait = 5 * time.Second
 
+// confirmationLimit is how long held words wait for the person to confirm
+// them before they expire, unsent.
+var confirmationLimit = 2 * time.Minute
+
+// Errors of ConfirmHeldWords.
+var (
+	ErrNothingAwaitingConfirmation = errors.New("no words are awaiting confirmation")
+	ErrConfirmationTextDiffers     = errors.New("the text does not match the words held")
+)
+
 // sessionStatesThatEndATurn are bridge states after which no result will
 // come for the message sent.
 var sessionStatesThatEndATurn = map[msg.SessionState]bool{msg.SessionAborted: true, msg.SessionError: true, msg.SessionDisconnected: true}
@@ -147,6 +157,18 @@ type utteranceRun struct {
 	target          UtteranceTarget
 	targetTexts     []string
 	targetDelivered bool
+	// confirmBeforeSend holds the joined words at finish until the person
+	// confirms them; confirmationTimer expires them.
+	confirmBeforeSend bool
+	held              bool
+	confirmationTimer *time.Timer
+}
+
+// collectsOneMessage reports whether the segments are kept and sent joined
+// once, rather than dispatched one by one: a session or signal target, or
+// any target whose words wait for confirmation.
+func (run *utteranceRun) collectsOneMessage() bool {
+	return run.target.deliversOneMessage() || run.confirmBeforeSend
 }
 
 // runFor returns the live run of an utterance, building it from the store
@@ -162,12 +184,18 @@ func (d *Dispatcher) runFor(utterance Utterance) (*utteranceRun, error) {
 		target = PoolTarget
 	}
 	run := &utteranceRun{dispatcher: d, utteranceID: utterance.UtteranceID, principalID: utterance.PrincipalID, hub: newEventHub(), mode: utterance.Mode,
-		jobs: make(chan func(), 64), stopped: make(chan struct{}), segments: map[int]Segment{}, sessions: map[string]*runSession{}, target: target}
+		jobs: make(chan func(), 64), stopped: make(chan struct{}), segments: map[int]Segment{}, sessions: map[string]*runSession{}, target: target,
+		confirmBeforeSend: utterance.ConfirmBeforeSend && target.heldForConfirmation()}
 	if err := run.loadFromStore(utterance); err != nil {
 		return nil, err
 	}
 	d.runs[utterance.UtteranceID] = run
 	go run.work()
+	if utterance.ConfirmationState == ConfirmationAwaiting && utterance.ConfirmationExpiresAtMs != nil {
+		// Words held by an earlier process still wait, until their own
+		// expiry.
+		run.awaitConfirmation(utterance.ConfirmationText, *utterance.ConfirmationExpiresAtMs)
+	}
 	run.checkDone()
 	return run, nil
 }
@@ -191,7 +219,7 @@ func (run *utteranceRun) loadFromStore(utterance Utterance) error {
 	}
 	for _, session := range sessions {
 		run.sessions[session.SessionID] = &runSession{sessionID: session.SessionID, segmentIndexes: session.SegmentIndexes, text: session.Text,
-			role: session.Role, turnFinished: true, stopped: session.StoppedAtMs != nil, ownedByVoiceIntake: !run.target.deliversOneMessage()}
+			role: session.Role, turnFinished: true, stopped: session.StoppedAtMs != nil, ownedByVoiceIntake: run.target.Kind != TargetSession && run.target.Kind != TargetSignal}
 		run.order = append(run.order, session.SessionID)
 		run.hub.publish(eventDispatch, dispatchEventData(session.SessionID, session.SegmentIndexes, session.Text))
 	}
@@ -205,7 +233,11 @@ func (run *utteranceRun) loadFromStore(utterance Utterance) error {
 	run.final = utterance.FinalizedAtMs != nil
 	run.cancelled = utterance.CancelledAtMs != nil
 	// A target utterance that reached a session has had its one message.
-	run.targetDelivered = run.target.deliversOneMessage() && len(sessions) > 0
+	run.targetDelivered = run.collectsOneMessage() && len(sessions) > 0
+	run.held = utterance.ConfirmationState != ""
+	if utterance.ConfirmationState == ConfirmationAwaiting {
+		run.targetTexts = []string{utterance.ConfirmationText}
+	}
 	return nil
 }
 
@@ -265,6 +297,12 @@ func (d *Dispatcher) Finish(utterance Utterance) error {
 	}
 	run.enqueue(func() {
 		run.processReadySegments()
+		if run.confirmBeforeSend {
+			// Nothing is sent, and nothing final, until the person confirms
+			// the words, cancels them, or lets them expire.
+			run.holdForConfirmation()
+			return
+		}
 		if run.target.deliversOneMessage() {
 			run.deliverToTarget()
 		}
@@ -273,11 +311,152 @@ func (d *Dispatcher) Finish(utterance Utterance) error {
 	return nil
 }
 
-// Cancel stops every session the utterance started.
+// holdForConfirmation keeps the joined words for the person to confirm and
+// tells the phone. With no words there is nothing to confirm and the
+// utterance ends. Run on the worker.
+func (run *utteranceRun) holdForConfirmation() {
+	d := run.dispatcher
+	run.mutex.Lock()
+	if run.held || run.cancelled {
+		run.mutex.Unlock()
+		return
+	}
+	run.held = true
+	text := strings.Join(run.targetTexts, " ")
+	target := run.target
+	run.mutex.Unlock()
+	if strings.TrimSpace(text) == "" {
+		run.recordError(fmt.Sprintf("no words were heard, so nothing was held for confirmation or sent to the %s", target.Kind))
+		run.finalize("no words were heard")
+		return
+	}
+	expiresAtMs := d.now().Add(confirmationLimit).UnixMilli()
+	if err := d.store.HoldForConfirmation(run.utteranceID, text, expiresAtMs); err != nil {
+		run.recordError(fmt.Sprintf("hold the words for confirmation: %v; nothing was sent", err))
+		run.finalize("the words could not be held for confirmation")
+		return
+	}
+	run.awaitConfirmation(text, expiresAtMs)
+}
+
+// awaitConfirmation tells the phone what is held and starts the expiry.
+func (run *utteranceRun) awaitConfirmation(text string, expiresAtMs int64) {
+	d := run.dispatcher
+	run.hub.publish(eventAwaitingConfirmation, map[string]any{"text": text, "expires_at_ms": expiresAtMs})
+	wait := max(0, time.UnixMilli(expiresAtMs).Sub(d.now()))
+	run.mutex.Lock()
+	run.confirmationTimer = time.AfterFunc(wait, run.expireConfirmation)
+	run.mutex.Unlock()
+}
+
+// expireConfirmation ends held words nobody confirmed: recorded as
+// expired, never sent.
+func (run *utteranceRun) expireConfirmation() {
+	d := run.dispatcher
+	won, err := d.store.ResolveConfirmation(run.utteranceID, ConfirmationExpired, d.now().UnixMilli())
+	if err != nil {
+		run.recordError(fmt.Sprintf("expire the held words: %v", err))
+		return
+	}
+	if !won {
+		return
+	}
+	run.hub.publish(eventConfirmationEnded, map[string]any{"state": ConfirmationExpired})
+	run.enqueue(func() {
+		run.finalize(fmt.Sprintf("nobody confirmed the words within %s, so nothing was sent", confirmationLimit))
+	})
+}
+
+// ConfirmHeldWords sends the words the utterance holds. text, when given,
+// must be the words held: the phone sends what it showed.
+func (d *Dispatcher) ConfirmHeldWords(utterance Utterance, text *string) error {
+	run, err := d.runFor(utterance)
+	if err != nil {
+		return err
+	}
+	stored, err := d.store.GetUtterance(utterance.UtteranceID)
+	if err != nil {
+		return err
+	}
+	if stored.ConfirmationState != ConfirmationAwaiting {
+		return fmt.Errorf("%w (confirmation_state %q)", ErrNothingAwaitingConfirmation, stored.ConfirmationState)
+	}
+	if text != nil && strings.TrimSpace(*text) != strings.TrimSpace(stored.ConfirmationText) {
+		return fmt.Errorf("%w: held %q, got %q", ErrConfirmationTextDiffers, stored.ConfirmationText, *text)
+	}
+	won, err := d.store.ResolveConfirmation(utterance.UtteranceID, ConfirmationConfirmed, d.now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	if !won {
+		return fmt.Errorf("%w (it ended as this confirm arrived)", ErrNothingAwaitingConfirmation)
+	}
+	run.mutex.Lock()
+	if run.confirmationTimer != nil {
+		run.confirmationTimer.Stop()
+	}
+	run.mutex.Unlock()
+	run.hub.publish(eventConfirmationEnded, map[string]any{"state": ConfirmationConfirmed})
+	run.enqueue(func() {
+		run.sendHeldWords()
+		run.finalize("the person confirmed the words")
+	})
+	return nil
+}
+
+// sendHeldWords sends confirmed words: to the session or signal the phone
+// named, or to a new chat session. Run on the worker.
+func (run *utteranceRun) sendHeldWords() {
+	if run.target.Kind != TargetNewSession {
+		run.deliverToTarget()
+		return
+	}
+	run.mutex.Lock()
+	if run.targetDelivered || run.cancelled {
+		run.mutex.Unlock()
+		return
+	}
+	run.targetDelivered = true
+	text := strings.Join(run.targetTexts, " ")
+	indexes := run.spokenIndexes()
+	run.mutex.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	// dispatch records its own failure; finalize then keeps nothing.
+	_, _ = run.dispatch(ctx, indexes, text)
+}
+
+// spokenIndexes are the handled segments that had words, in order. The
+// caller holds run.mutex.
+func (run *utteranceRun) spokenIndexes() []int {
+	var indexes []int
+	for index, segment := range run.segments {
+		if index < run.nextIndex && hasWords(segment) {
+			indexes = append(indexes, index)
+		}
+	}
+	sort.Ints(indexes)
+	return indexes
+}
+
+// Cancel stops every session the utterance started, and discards words
+// held for confirmation.
 func (d *Dispatcher) Cancel(utterance Utterance) error {
 	run, err := d.runFor(utterance)
 	if err != nil {
 		return err
+	}
+	won, err := d.store.ResolveConfirmation(utterance.UtteranceID, ConfirmationCancelled, d.now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	if won {
+		run.mutex.Lock()
+		if run.confirmationTimer != nil {
+			run.confirmationTimer.Stop()
+		}
+		run.mutex.Unlock()
+		run.hub.publish(eventConfirmationEnded, map[string]any{"state": ConfirmationCancelled})
 	}
 	run.cancel()
 	return nil
@@ -308,9 +487,9 @@ func (run *utteranceRun) processReadySegments() {
 		// and changes nothing else: no dispatch, and the continuation
 		// window still runs from the last segment that had words.
 		spoken := hasWords(segment)
-		if run.target.deliversOneMessage() {
-			// Kept for the one message sent at finish; no window runs, since
-			// nothing is split or judged.
+		if run.collectsOneMessage() {
+			// Kept for the one message sent at finish (or at confirmation);
+			// no window runs, since nothing is split or judged.
 			run.mutex.Lock()
 			if spoken {
 				run.targetTexts = append(run.targetTexts, strings.TrimSpace(segment.Text))
@@ -618,15 +797,9 @@ func (run *utteranceRun) deliverToTarget() {
 	}
 	run.targetDelivered = true
 	text := strings.Join(run.targetTexts, " ")
-	var indexes []int
-	for index, segment := range run.segments {
-		if index < run.nextIndex && hasWords(segment) {
-			indexes = append(indexes, index)
-		}
-	}
+	indexes := run.spokenIndexes()
 	target := run.target
 	run.mutex.Unlock()
-	sort.Ints(indexes)
 	if strings.TrimSpace(text) == "" {
 		run.recordError(fmt.Sprintf("no words were heard, so nothing was sent to the %s the phone named", target.Kind))
 		return
