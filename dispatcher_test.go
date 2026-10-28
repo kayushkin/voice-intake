@@ -32,11 +32,20 @@ type fakeBridge struct {
 	shared     map[string][]string
 	streams    map[string]chan BridgeEvent
 	resultWait time.Duration
+
+	// The person's own sessions and open signals, for target tests.
+	sessionOwners map[string]string
+	openSignals   []bridgeSignal
+	personSent    map[string][]string
+	answers       []map[string]string
+	answerVia     string
+	chatCreated   []string
 }
 
 func newFakeBridge() *fakeBridge {
 	return &fakeBridge{sent: map[string][]string{}, renamed: map[string]string{}, shared: map[string][]string{},
-		streams: map[string]chan BridgeEvent{}, resultWait: 20 * time.Millisecond}
+		streams: map[string]chan BridgeEvent{}, resultWait: 20 * time.Millisecond,
+		sessionOwners: map[string]string{}, personSent: map[string][]string{}, answerVia: "message"}
 }
 
 func (b *fakeBridge) stream(sessionID string) chan BridgeEvent {
@@ -127,6 +136,93 @@ func (b *fakeBridge) InstanceOneshot(ctx context.Context, instanceID, model, sys
 	return OneshotAnswer{Text: "oneshot answer to " + prompt, Model: model}, nil
 }
 
+// ownSession gives the person a session that has already finished a turn:
+// like the bridge, its stream first sends that turn again to a subscriber.
+func (b *fakeBridge) ownSession(sessionID, principalID string) {
+	b.mutex.Lock()
+	b.sessionOwners[sessionID] = principalID
+	b.mutex.Unlock()
+	events := b.stream(sessionID)
+	events <- BridgeEvent{Type: "block", Data: json.RawMessage(`{"type":"block","bridge_session_id":"` + sessionID + `"}`)}
+	events <- BridgeEvent{Type: "result", Data: json.RawMessage(`{"type":"result","bridge_session_id":"` + sessionID + `","result":{"text":"stale reply from the turn before"}}`)}
+}
+
+// replyAfterOwnMessage sends what the bridge sends for a new message: the
+// user_message, then a block and a result.
+func (b *fakeBridge) replyAfterOwnMessage(sessionID, text string, withUserMessage bool) {
+	events := b.stream(sessionID)
+	go func() {
+		if withUserMessage {
+			events <- BridgeEvent{Type: "user_message", Data: json.RawMessage(`{"type":"user_message","bridge_session_id":"` + sessionID + `"}`)}
+		}
+		events <- BridgeEvent{Type: "block", Data: json.RawMessage(`{"type":"block","bridge_session_id":"` + sessionID + `"}`)}
+		time.Sleep(b.resultWait)
+		events <- BridgeEvent{Type: "result", Data: json.RawMessage(`{"type":"result","bridge_session_id":"` + sessionID + `","result":{"text":"answer to ` + strings.ReplaceAll(text, `"`, `'`) + `"}}`)}
+	}()
+}
+
+func (b *fakeBridge) CreateChatSession(ctx context.Context, principalID, displayName string) (string, string, error) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	b.next++
+	sessionID := fmt.Sprintf("br_chat_%d", b.next)
+	b.chatCreated = append(b.chatCreated, sessionID)
+	b.createdIDs = append(b.createdIDs, sessionID)
+	return sessionID, "instance-the-chat-picks", nil
+}
+
+func (b *fakeBridge) CheckSessionOwner(ctx context.Context, principalID, sessionID string) error {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	if b.sessionOwners[sessionID] != principalID {
+		return fmt.Errorf("no session %s: %w", sessionID, ErrTargetNotFound)
+	}
+	return nil
+}
+
+func (b *fakeBridge) OpenQuestionOf(ctx context.Context, principalID, signalID string) (OpenQuestion, error) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	var mine []bridgeSignal
+	for _, signal := range b.openSignals {
+		if b.sessionOwners[signal.SessionID] == principalID {
+			mine = append(mine, signal)
+		}
+	}
+	return openQuestionFrom(mine, signalID)
+}
+
+func (b *fakeBridge) SendMessageAsPerson(ctx context.Context, principalID, sessionID, text string) error {
+	if err := b.CheckSessionOwner(ctx, principalID, sessionID); err != nil {
+		return err
+	}
+	b.mutex.Lock()
+	b.personSent[sessionID] = append(b.personSent[sessionID], text)
+	b.mutex.Unlock()
+	b.replyAfterOwnMessage(sessionID, text, true)
+	return nil
+}
+
+func (b *fakeBridge) AnswerSignal(ctx context.Context, principalID, signalID string, answers map[string]string) (string, error) {
+	question, err := b.OpenQuestionOf(ctx, principalID, signalID)
+	if err != nil {
+		return "", err
+	}
+	b.mutex.Lock()
+	b.answers = append(b.answers, answers)
+	via := b.answerVia
+	remaining := b.openSignals[:0]
+	for _, signal := range b.openSignals {
+		if _, answered := answers[signal.ID]; !answered {
+			remaining = append(remaining, signal)
+		}
+	}
+	b.openSignals = remaining
+	b.mutex.Unlock()
+	b.replyAfterOwnMessage(question.SessionID, answers[signalID], via == "message")
+	return via, nil
+}
+
 func (b *fakeBridge) snapshot() (created []SessionCreation, ids []string, sent map[string][]string, stopped []string) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
@@ -158,9 +254,9 @@ func (j *fakeJudge) Judge(ctx context.Context, modelRole, earlierText, newText s
 }
 
 type harness struct {
-	t      *testing.T
-	bridge *fakeBridge
-	judge  *fakeJudge
+	t        *testing.T
+	bridge   *fakeBridge
+	judge    *fakeJudge
 	pool     *SessionPool
 	server   *httptest.Server
 	detector *fakeDetector

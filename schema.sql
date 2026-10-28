@@ -36,6 +36,12 @@ CREATE TABLE IF NOT EXISTS utterances (
     stop_reason                  TEXT NOT NULL DEFAULT '',
     -- Set when the utterance is a replay of a stored recording or text.
     replay_id                    TEXT NOT NULL DEFAULT '',
+    -- Where the words go: 'pool' (a voice session, split and judged),
+    -- 'new_session' (an ordinary chat session), 'session' (the next message
+    -- of target_session_id) or 'signal' (the answer to target_signal_id).
+    target_kind                  TEXT NOT NULL DEFAULT 'pool',
+    target_session_id            TEXT NOT NULL DEFAULT '',
+    target_signal_id             TEXT NOT NULL DEFAULT '',
     UNIQUE (principal_id, client_utterance_id)
 );
 

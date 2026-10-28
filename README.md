@@ -28,7 +28,7 @@ time with it. Both values are stored.
 
 | Route | Does |
 |-------|------|
-| `POST /api/voice/utterances` | `{"client_utterance_id","mode","strategy","trigger","speech_started_at_ms"}` → 201 `{"utterance_id":"utterance_000001"}`; the same `client_utterance_id` again → 200, same row |
+| `POST /api/voice/utterances` | `{"client_utterance_id","mode","strategy","trigger","speech_started_at_ms"}` and optionally `"target"` (below) → 201 `{"utterance_id":"utterance_000001"}`; the same `client_utterance_id` again → 200, same row; a target session or signal that is missing or someone else's → 404, a signal that is not an open question → 409, the bridge not answering → 502 |
 | `POST /api/voice/utterances/{id}/segments` | `{"index","text","speech_ended_at_ms"}` → 202 and dispatch; an index already received → 200, ignored; after cancel → 409 |
 | `POST /api/voice/utterances/{id}/segments/{index}/audio?speech_ended_at_ms=…` | body the segment's sound, `audio/wav`, 16 kHz mono 16-bit PCM; transcribed, then handled as a text segment with that index → 202 `{"text","transcription_ms","audio_duration_ms","status":"accepted"}`; no words → 200 `"status":"no words"`, stored, not dispatched; an index already received → 200, not transcribed; after cancel → 409; transcription failed → 502, nothing stored; no transcription service set → 503 (an addition: see *Contract changes*) |
 | `POST /api/voice/utterances/{id}/finish` | `{"ended_at_ms"}` → 200; decisions become final once every received segment is handled |
@@ -87,6 +87,18 @@ last segment that had words.
 - **Segments are handled one at a time per utterance, in index order.** A segment that arrives while the previous one is still being judged waits for that decision, so a request is never joined onto a session that is about to be superseded. A segment that arrives out of order waits for the missing index.
 - **When the judge fails**, the joined session is kept, since its text holds every word, and the failure is in the decision's reason and the judgment row. When only one of the two new sessions could be started, that one decides.
 - **Effort** is `default_effort` unless the text contains one of `effort_raising_phrases` (any case) or the utterance is in long mode, and then `raised_effort`, on `raised_instance_id` and `raised_model` when they are set. A raised text never goes to a pooled session, which runs at the default.
+
+## Targets: where the words go
+
+`target` on `POST /api/voice/utterances` says where the words go. Leaving it
+out is the same as `{"kind":"pool"}`.
+
+- `{"kind":"pool"}`: as above. A pooled voice session, or a fresh one like it, and later segments split and judged.
+- `{"kind":"new_session"}`: an ordinary chat session, started as the chat's New button starts one: on the instance the chat would pick from llm-bridge-server's `bridge-prefs` (the recorded last instance if it is enabled, else an enabled instance of the recorded last harness, preferring one with a last session), with type `interactive`, purpose `chat` and origin `voice-intake`, and with no model, effort, spend ceiling or tools sent, so the bridge pins the chat's harness defaults. Not a pooled session, and not the voice working directory or its short prompt. Segments are dispatched and judged as for the pool, each new session being a chat session; the effort-raising phrases and the raised settings do not apply.
+- `{"kind":"session","session_id":"br_…"}`: the words go as the next message of a session the person already has. The bridge is asked, as the person, at create (404 if the session is missing or not theirs) and again by the send itself.
+- `{"kind":"signal","signal_id":"sig_…"}`: the words answer an open question through llm-bridge-server's `POST /signals/{id}/answer`. The bridge resolves the questions of one call or turn only all at once, so every open question that shares the signal's session and request id gets the same words. A notification or a closed question is 409 at create.
+
+For `session` and `signal` nothing is split or judged: the segments are kept, in order, and sent joined as **one message when the utterance finishes** (after `finish`, or once a streamed utterance's `stop` has every segment transcribed). Streaming still ends segments at pauses, so `stop_recording` still comes when the continuation window closes. The reply streams on `/events` as `session_event`, with one `dispatch` and one `decision` (`kept`) for the person's session. When the bridge is first asked for an existing session's events it sends that session's last turn again; those events, and the user message itself, are not passed on, so the first `result` the phone sees is the reply to these words (when the answer goes to a tool call still parked in a running turn, that turn's events are passed on at once). The person's session is never stopped or archived from here, not even by `cancel`, and the recording is not shared into it. A message sent while the session is still mid-turn may be followed first by that turn's own result.
 
 ## The pool
 
@@ -223,4 +235,5 @@ which a client that ignores unknown fields and events has to handle:
 - `GET /api/voice/settings` carries five more fields: `transcriber`, `no_speech_timeout_ms`, `maximum_recording_ms`, `raised_instance_id`, `raised_model`.
 - A session in `GET /api/voice/utterances/{id}` carries `working_directory`, `reply_text` and `turn_cost_usd`.
 - Replay routes and `GET /api/voice/latency?group_by=configuration`, above. They are for measuring settings, not for the phone.
+- `POST /api/voice/utterances` takes an optional `target` (*Targets*, above): `pool` (the default and the behaviour before), `new_session`, `session` with `session_id`, or `signal` with `signal_id`; an unknown kind, a missing id or an id on the wrong kind is 400. Each utterance in `GET /api/voice/utterances/{id}` and the list carries `target` as stored, `{"kind":"pool"}` for one made without.
 - `GET /api/voice/utterances/{id}` and the list carry more fields than the contract names: the phone's own timestamps beside the server-time ones, the clock skew, audio details, errors and the continuation judgments.

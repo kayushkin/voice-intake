@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -100,6 +101,14 @@ type runSession struct {
 	turnFinished   bool
 	stopped        bool
 	cancelStream   context.CancelFunc
+	// ownedByVoiceIntake is false for a session the person already had (a
+	// session or signal target): it is never stopped or archived from here.
+	ownedByVoiceIntake bool
+	// awaitingOwnMessage holds back the events of a session the person
+	// already had until the message this utterance sent shows on its
+	// stream: a new subscriber is first sent the session's last turn again,
+	// whose result is not the reply to these words.
+	awaitingOwnMessage bool
 }
 
 type utteranceAudio struct {
@@ -132,6 +141,12 @@ type utteranceRun struct {
 	mode        string
 	stream      *audioStream
 	overrides   *dispatchOverrides
+	// target is where the words go. For a session or signal target the
+	// spoken segments are kept here, in order, and sent as one message when
+	// the utterance finishes.
+	target          UtteranceTarget
+	targetTexts     []string
+	targetDelivered bool
 }
 
 // runFor returns the live run of an utterance, building it from the store
@@ -142,8 +157,12 @@ func (d *Dispatcher) runFor(utterance Utterance) (*utteranceRun, error) {
 	if run, ok := d.runs[utterance.UtteranceID]; ok {
 		return run, nil
 	}
+	target := utterance.Target
+	if target.Kind == "" {
+		target = PoolTarget
+	}
 	run := &utteranceRun{dispatcher: d, utteranceID: utterance.UtteranceID, principalID: utterance.PrincipalID, hub: newEventHub(), mode: utterance.Mode,
-		jobs: make(chan func(), 64), stopped: make(chan struct{}), segments: map[int]Segment{}, sessions: map[string]*runSession{}}
+		jobs: make(chan func(), 64), stopped: make(chan struct{}), segments: map[int]Segment{}, sessions: map[string]*runSession{}, target: target}
 	if err := run.loadFromStore(utterance); err != nil {
 		return nil, err
 	}
@@ -172,7 +191,7 @@ func (run *utteranceRun) loadFromStore(utterance Utterance) error {
 	}
 	for _, session := range sessions {
 		run.sessions[session.SessionID] = &runSession{sessionID: session.SessionID, segmentIndexes: session.SegmentIndexes, text: session.Text,
-			role: session.Role, turnFinished: true, stopped: session.StoppedAtMs != nil}
+			role: session.Role, turnFinished: true, stopped: session.StoppedAtMs != nil, ownedByVoiceIntake: !run.target.deliversOneMessage()}
 		run.order = append(run.order, session.SessionID)
 		run.hub.publish(eventDispatch, dispatchEventData(session.SessionID, session.SegmentIndexes, session.Text))
 	}
@@ -185,6 +204,8 @@ func (run *utteranceRun) loadFromStore(utterance Utterance) error {
 	}
 	run.final = utterance.FinalizedAtMs != nil
 	run.cancelled = utterance.CancelledAtMs != nil
+	// A target utterance that reached a session has had its one message.
+	run.targetDelivered = run.target.deliversOneMessage() && len(sessions) > 0
 	return nil
 }
 
@@ -244,6 +265,9 @@ func (d *Dispatcher) Finish(utterance Utterance) error {
 	}
 	run.enqueue(func() {
 		run.processReadySegments()
+		if run.target.deliversOneMessage() {
+			run.deliverToTarget()
+		}
 		run.finalize("the phone finished the utterance")
 	})
 	return nil
@@ -284,6 +308,17 @@ func (run *utteranceRun) processReadySegments() {
 		// and changes nothing else: no dispatch, and the continuation
 		// window still runs from the last segment that had words.
 		spoken := hasWords(segment)
+		if run.target.deliversOneMessage() {
+			// Kept for the one message sent at finish; no window runs, since
+			// nothing is split or judged.
+			run.mutex.Lock()
+			if spoken {
+				run.targetTexts = append(run.targetTexts, strings.TrimSpace(segment.Text))
+			}
+			run.nextIndex = segment.Index + 1
+			run.mutex.Unlock()
+			continue
+		}
 		if spoken {
 			run.mutex.Lock()
 			overrides := run.overrides
@@ -489,7 +524,15 @@ func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, tex
 		sessionID, pooledState, pooled = d.pool.Take(ctx, run.principalID, run.utteranceID, settings)
 	}
 	effort := choice.effort
-	if !pooled {
+	switch {
+	case choice.chatSession:
+		created, instanceID, err := d.bridge.CreateChatSession(ctx, run.principalID, text)
+		if err != nil {
+			run.recordError(fmt.Sprintf("segments %v: start a chat session: %v", segmentIndexes, err))
+			return nil, err
+		}
+		sessionID, choice.instanceID = created, instanceID
+	case !pooled:
 		created, err := d.bridge.CreateSession(ctx, SessionCreation{PrincipalID: run.principalID, InstanceID: choice.instanceID, Effort: effort,
 			Model: choice.model, WorkingDirectory: choice.workingDirectory, DisplayName: text, MaxBudgetUSD: choice.maxBudgetUSD})
 		if err != nil {
@@ -502,7 +545,7 @@ func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, tex
 		defer d.pool.Fill(run.principalID)
 	}
 
-	session := &runSession{sessionID: sessionID, segmentIndexes: segmentIndexes, text: text, role: RoleSpeculative}
+	session := &runSession{sessionID: sessionID, segmentIndexes: segmentIndexes, text: text, role: RoleSpeculative, ownedByVoiceIntake: true}
 	record := UtteranceSession{SessionID: sessionID, UtteranceID: run.utteranceID, SegmentIndexes: segmentIndexes, Text: text, Role: RoleSpeculative,
 		Pooled: pooled, PooledSessionState: pooledState, Effort: effort, Model: choice.model, InstanceID: choice.instanceID,
 		WorkingDirectory: choice.workingDirectory, DispatchStartedAtMs: started.UnixMilli()}
@@ -563,6 +606,108 @@ func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, tex
 	return session, nil
 }
 
+// deliverToTarget sends the utterance's words, joined, to the session or
+// question the phone named, once, and follows that session's reply. Run on
+// the worker after every segment received is handled.
+func (run *utteranceRun) deliverToTarget() {
+	d := run.dispatcher
+	run.mutex.Lock()
+	if run.targetDelivered || run.cancelled {
+		run.mutex.Unlock()
+		return
+	}
+	run.targetDelivered = true
+	text := strings.Join(run.targetTexts, " ")
+	var indexes []int
+	for index, segment := range run.segments {
+		if index < run.nextIndex && hasWords(segment) {
+			indexes = append(indexes, index)
+		}
+	}
+	target := run.target
+	run.mutex.Unlock()
+	sort.Ints(indexes)
+	if strings.TrimSpace(text) == "" {
+		run.recordError(fmt.Sprintf("no words were heard, so nothing was sent to the %s the phone named", target.Kind))
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	started := d.now()
+
+	sessionID := target.SessionID
+	var question OpenQuestion
+	if target.Kind == TargetSignal {
+		var err error
+		question, err = d.bridge.OpenQuestionOf(ctx, run.principalID, target.SignalID)
+		if err != nil {
+			run.recordError(fmt.Sprintf("answer signal %s: %v", target.SignalID, err))
+			return
+		}
+		sessionID = question.SessionID
+	}
+
+	session := &runSession{sessionID: sessionID, segmentIndexes: indexes, text: text, role: RoleSpeculative, awaitingOwnMessage: true}
+	record := UtteranceSession{SessionID: sessionID, UtteranceID: run.utteranceID, SegmentIndexes: indexes, Text: text, Role: RoleSpeculative,
+		DispatchStartedAtMs: started.UnixMilli()}
+	if err := d.store.InsertUtteranceSession(record); err != nil {
+		log.Printf("[dispatch] ERROR %s: record session %s: %v", run.utteranceID, sessionID, err)
+	}
+	streamContext, cancelStream := context.WithTimeout(context.Background(), sessionTurnLimit)
+	session.cancelStream = cancelStream
+	run.mutex.Lock()
+	run.sessions[sessionID] = session
+	run.order = append(run.order, sessionID)
+	run.mutex.Unlock()
+
+	connected, streamEnded := make(chan struct{}), make(chan struct{})
+	go run.streamSession(streamContext, session, connected, streamEnded)
+	select {
+	case <-connected:
+	case <-streamEnded:
+	case <-time.After(streamOpenWait):
+		log.Printf("[dispatch] %s: the event stream of %s did not open in %s; sending anyway", run.utteranceID, sessionID, streamOpenWait)
+	}
+
+	var reason string
+	var err error
+	switch target.Kind {
+	case TargetSession:
+		err = d.bridge.SendMessageAsPerson(ctx, run.principalID, sessionID, text)
+		reason = "sent as the next message of the session the phone named"
+	case TargetSignal:
+		answers := map[string]string{}
+		for _, signalID := range question.GroupSignalIDs {
+			answers[signalID] = text
+		}
+		var deliveredVia string
+		deliveredVia, err = d.bridge.AnswerSignal(ctx, run.principalID, question.SignalID, answers)
+		if err == nil && deliveredVia == "parked_hook" {
+			// The answer went to a tool call still waiting in the turn now
+			// running: no new message starts a turn, and that turn's
+			// replayed events hold no result, so pass everything on.
+			run.mutex.Lock()
+			session.awaitingOwnMessage = false
+			run.mutex.Unlock()
+		}
+		reason = fmt.Sprintf("the words answered signal %s (%q, %d question(s) in its group; delivered as %s)",
+			question.SignalID, question.Title, len(question.GroupSignalIDs), deliveredVia)
+	}
+	if err != nil {
+		run.recordError(fmt.Sprintf("send to %s %s: %v", target.Kind, sessionID, err))
+		if storeErr := d.store.SetSessionError(sessionID, err.Error()); storeErr != nil {
+			log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, storeErr)
+		}
+		run.stopSession(session, "its text could not be sent")
+		return
+	}
+	if err := d.store.SetSessionDispatched(sessionID, d.now().UnixMilli()); err != nil {
+		log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
+	}
+	run.hub.publish(eventDispatch, dispatchEventData(sessionID, indexes, text))
+	run.decide(sessionID, RoleKept, reason)
+}
+
 // sessionChoice is where and how one text's session runs.
 type sessionChoice struct {
 	instanceID       string
@@ -572,6 +717,9 @@ type sessionChoice struct {
 	maxBudgetUSD     float64
 	usePool          bool
 	warmSessionID    string
+	// chatSession starts an ordinary chat session, with the chat's own
+	// defaults, instead of a voice session (target new_session).
+	chatSession bool
 }
 
 // sessionChoice reads it: a replay's configuration; else the raised
@@ -585,6 +733,11 @@ func (run *utteranceRun) sessionChoice(text string, settings DispatchSettings) s
 			maxBudgetUSD: o.maxBudgetUSD, warmSessionID: o.warmSessionID}
 		o.warmSessionID = ""
 		return choice
+	}
+	if run.target.Kind == TargetNewSession {
+		// The chat's defaults decide model, effort and instance; the voice
+		// settings do not apply to an ordinary chat.
+		return sessionChoice{chatSession: true}
 	}
 	choice := sessionChoice{instanceID: settings.InstanceID, model: settings.DefaultModel, effort: effortFor(text, settings),
 		workingDirectory: settings.WorkingDirectory}
@@ -611,6 +764,17 @@ func (run *utteranceRun) streamSession(ctx context.Context, session *runSession,
 	var connectOnce sync.Once
 	sawResult := false
 	err := d.bridge.StreamSessionEvents(ctx, session.sessionID, func() { connectOnce.Do(func() { close(connected) }) }, func(event BridgeEvent) bool {
+		run.mutex.Lock()
+		awaiting := session.awaitingOwnMessage
+		if awaiting && msg.EventType(event.Type) == msg.EventUserMessage {
+			session.awaitingOwnMessage = false
+		}
+		run.mutex.Unlock()
+		if awaiting {
+			// The session's earlier turn, sent again to a new subscriber, or
+			// the message itself: neither is the reply.
+			return true
+		}
 		at := d.now().UnixMilli()
 		switch msg.EventType(event.Type) {
 		case msg.EventBlock:
@@ -729,9 +893,21 @@ func (run *utteranceRun) stopSession(session *runSession, reason string) {
 	}
 	session.stopped = true
 	cancelStream := session.cancelStream
+	owned := session.ownedByVoiceIntake
 	run.mutex.Unlock()
 	if cancelStream != nil {
 		cancelStream()
+	}
+	if !owned {
+		// The person's own session: stop following it, and leave it running.
+		if err := d.store.SetSessionStopped(session.sessionID, d.now().UnixMilli(), reason+"; stopped following it, and left the session as it was"); err != nil {
+			log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
+		}
+		run.mutex.Lock()
+		session.turnFinished = true
+		run.mutex.Unlock()
+		run.checkDone()
+		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -930,7 +1106,7 @@ func (d *Dispatcher) ReceiveAudio(utterance Utterance, filename, contentType str
 	var targets []*runSession
 	for _, sessionID := range run.order {
 		session := run.sessions[sessionID]
-		if session.role != RoleSuperseded && !session.stopped {
+		if session.role != RoleSuperseded && !session.stopped && session.ownedByVoiceIntake {
 			targets = append(targets, session)
 		}
 	}

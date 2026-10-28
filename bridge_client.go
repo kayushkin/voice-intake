@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,6 +51,25 @@ type SessionBridge interface {
 	InstanceExists(ctx context.Context, instanceID string) (bool, error)
 	// InstanceOneshot is one model call on an instance with no session.
 	InstanceOneshot(ctx context.Context, instanceID, model, systemPrompt, prompt string) (OneshotAnswer, error)
+
+	// CreateChatSession starts an ordinary chat session for the person, on
+	// the instance the chat's New button would pick, and answers its id and
+	// that instance.
+	CreateChatSession(ctx context.Context, principalID, displayName string) (sessionID, instanceID string, err error)
+	// CheckSessionOwner answers ErrTargetNotFound unless the session exists
+	// and the person may reach it.
+	CheckSessionOwner(ctx context.Context, principalID, sessionID string) error
+	// OpenQuestionOf reads the person's open question signal and the
+	// questions that resolve with it: ErrTargetNotFound for none,
+	// ErrSignalNotAnswerable for a notification or a closed one.
+	OpenQuestionOf(ctx context.Context, principalID, signalID string) (OpenQuestion, error)
+	// SendMessageAsPerson sends text into a session as the person, so the
+	// bridge refuses a session that is not theirs.
+	SendMessageAsPerson(ctx context.Context, principalID, sessionID, text string) error
+	// AnswerSignal answers a question group through POST
+	// /signals/{id}/answer and says how the bridge delivered it:
+	// "parked_hook" or "message".
+	AnswerSignal(ctx context.Context, principalID, signalID string, answers map[string]string) (string, error)
 }
 
 // OneshotAnswer is the bridge's answer to a oneshot call.
@@ -128,7 +148,8 @@ func (b *HTTPSessionBridge) do(ctx context.Context, method, path, principalID st
 		return fmt.Errorf("llm-bridge-server %s %s: read answer: %w", method, path, err)
 	}
 	if response.StatusCode/100 != 2 {
-		return fmt.Errorf("llm-bridge-server %s %s answered %d: %s", method, path, response.StatusCode, strings.TrimSpace(string(responseBody)))
+		return bridgeStatusError{status: response.StatusCode,
+			message: fmt.Sprintf("llm-bridge-server %s %s answered %d: %s", method, path, response.StatusCode, strings.TrimSpace(string(responseBody)))}
 	}
 	if answer != nil {
 		if err := json.Unmarshal(responseBody, answer); err != nil {
@@ -160,6 +181,23 @@ func (b *HTTPSessionBridge) instanceHarness(ctx context.Context, instanceID stri
 type bridgeInstance struct {
 	ID          string `json:"id"`
 	HarnessType string `json:"harness_type"`
+	Enabled     bool   `json:"enabled"`
+}
+
+// bridgeStatusError is a refusal from the bridge, with its status.
+type bridgeStatusError struct {
+	status  int
+	message string
+}
+
+func (e bridgeStatusError) Error() string { return e.message }
+
+func bridgeStatusOf(err error) int {
+	var statusError bridgeStatusError
+	if errors.As(err, &statusError) {
+		return statusError.status
+	}
+	return 0
 }
 
 func (b *HTTPSessionBridge) instances(ctx context.Context) ([]bridgeInstance, error) {
@@ -340,4 +378,180 @@ func readServerSentEvents(body io.Reader, deliver func(BridgeEvent) bool) error 
 		}
 	}
 	return scanner.Err()
+}
+
+// chatSessionPurpose is what the chat's New button sends; a voice-started
+// chat is an ordinary chat, only begun by voice.
+const chatSessionPurpose = "chat"
+
+// bridgePreferences is the part of GET /bridge-prefs the chat reads to pick
+// where a new chat starts.
+type bridgePreferences struct {
+	LastInstanceID string            `json:"last_instance_id"`
+	LastHarness    string            `json:"last_harness"`
+	LastSession    map[string]string `json:"last_session"`
+}
+
+// chatInstanceFor picks the instance a new chat starts on, by the ladder the
+// chat itself uses (bridge-ui useNewSessionTarget): the recorded last
+// instance if it is still enabled; else an enabled instance of the recorded
+// last harness, preferring one that has a last session; else none.
+func chatInstanceFor(preferences bridgePreferences, instances []bridgeInstance) (bridgeInstance, bool) {
+	if preferences.LastInstanceID != "" {
+		for _, instance := range instances {
+			if instance.ID == preferences.LastInstanceID && instance.Enabled {
+				return instance, true
+			}
+		}
+	}
+	if preferences.LastHarness == "" {
+		return bridgeInstance{}, false
+	}
+	var first *bridgeInstance
+	for index := range instances {
+		instance := instances[index]
+		if !instance.Enabled || instance.HarnessType != preferences.LastHarness {
+			continue
+		}
+		if _, used := preferences.LastSession[instance.ID]; used {
+			return instance, true
+		}
+		if first == nil {
+			first = &instances[index]
+		}
+	}
+	if first == nil {
+		return bridgeInstance{}, false
+	}
+	return *first, true
+}
+
+// CreateChatSession starts a chat session as the person, where the chat's
+// New button would. Model, effort, spend ceiling and disabled tools are left
+// out, so the bridge pins the harness defaults from bridge-prefs as it does
+// for the chat.
+func (b *HTTPSessionBridge) CreateChatSession(ctx context.Context, principalID, displayName string) (string, string, error) {
+	var preferences bridgePreferences
+	if err := b.do(ctx, http.MethodGet, "/bridge-prefs", "", nil, &preferences); err != nil {
+		return "", "", err
+	}
+	instances, err := b.instances(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	instance, found := chatInstanceFor(preferences, instances)
+	if !found {
+		return "", "", fmt.Errorf("bridge-prefs records no enabled last instance (%q) or harness (%q), so a new chat has nowhere to start",
+			preferences.LastInstanceID, preferences.LastHarness)
+	}
+	request := msg.CreateSessionRequest{
+		Harness:     msg.Harness(instance.HarnessType),
+		InstanceID:  instance.ID,
+		DisplayName: displayName,
+		PrincipalID: principalID,
+		AutoStart:   true,
+		Type:        msg.SessionTypeInteractive,
+		Purpose:     chatSessionPurpose,
+		Origin:      voiceSessionOrigin,
+	}
+	var answer struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := b.do(ctx, http.MethodPost, "/sessions", principalID, request, &answer); err != nil {
+		return "", "", err
+	}
+	if answer.SessionID == "" {
+		return "", "", fmt.Errorf("llm-bridge-server POST /sessions answered with no session_id")
+	}
+	return answer.SessionID, instance.ID, nil
+}
+
+// CheckSessionOwner reads the session as the person: the bridge answers 404
+// for one that is missing and for one that is someone else's.
+func (b *HTTPSessionBridge) CheckSessionOwner(ctx context.Context, principalID, sessionID string) error {
+	err := b.do(ctx, http.MethodGet, "/sessions/"+url.PathEscape(sessionID), principalID, nil, nil)
+	if bridgeStatusOf(err) == http.StatusNotFound {
+		return fmt.Errorf("no session %s for %s: %w", sessionID, principalID, ErrTargetNotFound)
+	}
+	return err
+}
+
+// bridgeSignal is the part of msg.Signal this service reads.
+type bridgeSignal struct {
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	Kind      string `json:"kind"`
+	RequestID string `json:"request_id"`
+	Title     string `json:"title"`
+	State     string `json:"state"`
+}
+
+// openSignalReadLimit bounds the inbox read that finds one signal; the
+// bridge has no route that reads a single signal.
+const openSignalReadLimit = 500
+
+// OpenQuestionOf finds the signal in the person's open inbox. The bridge
+// narrows GET /signals to the person's own sessions, so a signal of someone
+// else's is not found.
+func (b *HTTPSessionBridge) OpenQuestionOf(ctx context.Context, principalID, signalID string) (OpenQuestion, error) {
+	var open []bridgeSignal
+	path := fmt.Sprintf("/signals?state=open&limit=%d", openSignalReadLimit)
+	if err := b.do(ctx, http.MethodGet, path, principalID, nil, &open); err != nil {
+		return OpenQuestion{}, err
+	}
+	return openQuestionFrom(open, signalID)
+}
+
+// openQuestionFrom finds signalID among open signals and gathers the open
+// questions that share its session and request id.
+func openQuestionFrom(open []bridgeSignal, signalID string) (OpenQuestion, error) {
+	var found *bridgeSignal
+	for index := range open {
+		if open[index].ID == signalID {
+			found = &open[index]
+			break
+		}
+	}
+	if found == nil {
+		return OpenQuestion{}, fmt.Errorf("no open signal %s: %w", signalID, ErrTargetNotFound)
+	}
+	if found.Kind != "question" {
+		return OpenQuestion{}, fmt.Errorf("signal %s is a %s, and only a question takes an answer: %w", signalID, found.Kind, ErrSignalNotAnswerable)
+	}
+	question := OpenQuestion{SignalID: found.ID, SessionID: found.SessionID, Title: found.Title, GroupSignalIDs: []string{found.ID}}
+	if found.RequestID == "" {
+		return question, nil
+	}
+	for _, sibling := range open {
+		if sibling.ID != found.ID && sibling.Kind == "question" && sibling.SessionID == found.SessionID && sibling.RequestID == found.RequestID {
+			question.GroupSignalIDs = append(question.GroupSignalIDs, sibling.ID)
+		}
+	}
+	return question, nil
+}
+
+// SendMessageAsPerson sends text into a session with the person named, so
+// the bridge holds the send to sessions the person owns.
+func (b *HTTPSessionBridge) SendMessageAsPerson(ctx context.Context, principalID, sessionID, text string) error {
+	err := b.do(ctx, http.MethodPost, "/sessions/"+url.PathEscape(sessionID)+"/send", principalID, msg.SendMessageRequest{Message: text}, nil)
+	if bridgeStatusOf(err) == http.StatusNotFound {
+		return fmt.Errorf("no session %s for %s: %w", sessionID, principalID, ErrTargetNotFound)
+	}
+	return err
+}
+
+// AnswerSignal posts the answers, keyed by signal id, as the person.
+func (b *HTTPSessionBridge) AnswerSignal(ctx context.Context, principalID, signalID string, answers map[string]string) (string, error) {
+	var answer struct {
+		Status       string `json:"status"`
+		DeliveredVia string `json:"delivered_via"`
+	}
+	err := b.do(ctx, http.MethodPost, "/signals/"+url.PathEscape(signalID)+"/answer", principalID, map[string]any{"answers": answers}, &answer)
+	switch bridgeStatusOf(err) {
+	case http.StatusNotFound:
+		return "", fmt.Errorf("no signal %s for %s: %w", signalID, principalID, ErrTargetNotFound)
+	case http.StatusConflict:
+		return "", fmt.Errorf("%v: %w", err, ErrSignalNotAnswerable)
+	}
+	return answer.DeliveredVia, err
 }

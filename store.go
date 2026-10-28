@@ -81,6 +81,9 @@ var columnsAddedAfterTheFirstSchema = []struct{ table, column, definition string
 	{"utterance_sessions", "working_directory", "TEXT NOT NULL DEFAULT ''"},
 	{"utterance_sessions", "reply_text", "TEXT NOT NULL DEFAULT ''"},
 	{"utterance_sessions", "turn_cost_usd", "REAL"},
+	{"utterances", "target_kind", "TEXT NOT NULL DEFAULT 'pool'"},
+	{"utterances", "target_session_id", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "target_signal_id", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func addMissingColumns(db *sql.DB) error {
@@ -164,6 +167,8 @@ type Utterance struct {
 	StoppedAtMs             *int64   `json:"stopped_at_ms"`
 	StopReason              string   `json:"stop_reason"`
 	ReplayID                string   `json:"replay_id"`
+	// Target is where the words go; kind pool when the phone named none.
+	Target UtteranceTarget `json:"target"`
 }
 
 // Segment is speech between two pauses.
@@ -265,7 +270,8 @@ const utteranceColumns = `utterance_id, client_utterance_id, principal_id, mode,
 	ended_at_client_ms, ended_at_ms, finished_at_ms, finalized_at_ms, cancelled_at_ms,
 	audio_filename, audio_content_type, audio_size_bytes, audio_received_at_ms, errors,
 	audio_streaming, audio_format, stream_received_bytes, stop_recording_reason, stop_recording_sent_at_ms,
-	stopped_at_client_ms, stopped_at_ms, stop_reason, replay_id`
+	stopped_at_client_ms, stopped_at_ms, stop_reason, replay_id,
+	target_kind, target_session_id, target_signal_id`
 
 type rowScanner interface {
 	Scan(destination ...any) error
@@ -280,7 +286,8 @@ func scanUtterance(row rowScanner) (Utterance, error) {
 		&utterance.EndedAtClientMs, &utterance.EndedAtMs, &utterance.FinishedAtMs, &utterance.FinalizedAtMs, &utterance.CancelledAtMs,
 		&utterance.AudioFilename, &utterance.AudioContentType, &utterance.AudioSizeBytes, &utterance.AudioReceivedAtMs, &errorsJSON,
 		&utterance.AudioStreaming, &utterance.AudioFormat, &utterance.StreamReceivedBytes, &utterance.StopRecordingReason, &utterance.StopRecordingSentAtMs,
-		&utterance.StoppedAtClientMs, &utterance.StoppedAtMs, &utterance.StopReason, &utterance.ReplayID)
+		&utterance.StoppedAtClientMs, &utterance.StoppedAtMs, &utterance.StopReason, &utterance.ReplayID,
+		&utterance.Target.Kind, &utterance.Target.SessionID, &utterance.Target.SignalID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Utterance{}, ErrNotFound
 	}
@@ -315,11 +322,16 @@ func (s *Store) CreateUtterance(utterance Utterance) (Utterance, bool, error) {
 	}
 	utterance.UtteranceID = fmt.Sprintf("utterance_%06d", next)
 	utterance.Errors = []string{}
+	if utterance.Target.Kind == "" {
+		utterance.Target = PoolTarget
+	}
 	_, err = transaction.Exec(`INSERT INTO utterances (sequence, utterance_id, client_utterance_id, principal_id, mode, strategy, trigger,
-		speech_started_at_client_ms, speech_started_at_ms, client_clock_skew_ms, received_at_ms, audio_streaming, audio_format, replay_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		speech_started_at_client_ms, speech_started_at_ms, client_clock_skew_ms, received_at_ms, audio_streaming, audio_format, replay_id,
+		target_kind, target_session_id, target_signal_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		next, utterance.UtteranceID, utterance.ClientUtteranceID, utterance.PrincipalID, utterance.Mode, utterance.Strategy, utterance.Trigger,
 		utterance.SpeechStartedAtClientMs, utterance.SpeechStartedAtMs, utterance.ClientClockSkewMs, utterance.ReceivedAtMs,
-		utterance.AudioStreaming, utterance.AudioFormat, utterance.ReplayID)
+		utterance.AudioStreaming, utterance.AudioFormat, utterance.ReplayID,
+		utterance.Target.Kind, utterance.Target.SessionID, utterance.Target.SignalID)
 	if err != nil {
 		return Utterance{}, false, err
 	}

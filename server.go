@@ -156,6 +156,8 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 		SpeechStartedAtMs *int64 `json:"speech_started_at_ms"`
 		AudioStreaming    bool   `json:"audio_streaming"`
 		AudioFormat       string `json:"audio_format"`
+		// Target is optional; left out, the words go to the pool.
+		Target *UtteranceTarget `json:"target"`
 	}
 	if err := decodeStrict(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -183,12 +185,23 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 	if !body.AudioStreaming && body.AudioFormat != "" {
 		problems = append(problems, "audio_format is for a streaming utterance; audio_streaming is not true")
 	}
+	target := PoolTarget
+	if body.Target != nil {
+		target = *body.Target
+		if err := target.validate(); err != nil {
+			problems = append(problems, err.Error())
+		}
+	}
 	skew, err := s.clientClockSkewMs(r, receivedAtMs)
 	if err != nil {
 		problems = append(problems, err.Error())
 	}
 	if len(problems) > 0 {
 		writeError(w, http.StatusBadRequest, strings.Join(problems, "; "))
+		return
+	}
+	if status, err := s.checkTarget(r.Context(), principalOf(r), target); err != nil {
+		writeError(w, status, err.Error())
 		return
 	}
 	if body.AudioStreaming {
@@ -200,7 +213,7 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 	utterance, created, err := s.store.CreateUtterance(Utterance{
 		ClientUtteranceID: body.ClientUtteranceID, PrincipalID: principalOf(r), Mode: body.Mode, Strategy: body.Strategy, Trigger: body.Trigger,
 		SpeechStartedAtClientMs: *body.SpeechStartedAtMs, SpeechStartedAtMs: *body.SpeechStartedAtMs + skew, ClientClockSkewMs: skew, ReceivedAtMs: receivedAtMs,
-		AudioStreaming: body.AudioStreaming, AudioFormat: body.AudioFormat,
+		AudioStreaming: body.AudioStreaming, AudioFormat: body.AudioFormat, Target: target,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -221,6 +234,36 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, status, map[string]string{"utterance_id": utterance.UtteranceID})
+}
+
+// targetCheckLimit bounds asking the bridge about a target at create.
+const targetCheckLimit = 15 * time.Second
+
+// checkTarget asks the bridge, as the person, whether the session or signal
+// the phone named is there to receive the words, so a wrong one is refused
+// before any audio is sent. The answer is checked again when the words go.
+func (s *Server) checkTarget(ctx context.Context, principalID string, target UtteranceTarget) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, targetCheckLimit)
+	defer cancel()
+	var err error
+	switch target.Kind {
+	case TargetSession:
+		err = s.dispatcher.bridge.CheckSessionOwner(ctx, principalID, target.SessionID)
+	case TargetSignal:
+		_, err = s.dispatcher.bridge.OpenQuestionOf(ctx, principalID, target.SignalID)
+	default:
+		return 0, nil
+	}
+	switch {
+	case err == nil:
+		return 0, nil
+	case errors.Is(err, ErrTargetNotFound):
+		return http.StatusNotFound, fmt.Errorf("target: %v", err)
+	case errors.Is(err, ErrSignalNotAnswerable):
+		return http.StatusConflict, fmt.Errorf("target: %v", err)
+	default:
+		return http.StatusBadGateway, fmt.Errorf("target: could not ask llm-bridge-server: %v", err)
+	}
 }
 
 func (s *Server) listUtterances(w http.ResponseWriter, r *http.Request) {
