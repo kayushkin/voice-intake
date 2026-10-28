@@ -381,4 +381,7 @@ func TestAReplayStreamsARecordingAndStopsItsSessionAfterTheTurn(t *testing.T) {
 	if group["replays"] != float64(1) || medians["endpoint_delay"] == nil || medians["speech_end_to_first_block"] == nil {
 		t.Fatalf("latency group = %v", group)
 	}
+	if _, live := h.call("GET", "/api/voice/latency?group_by=source", nil, testPrincipal); len(live["groups"].([]any)) != 0 {
+		t.Fatalf("the live latency table counts the replay: %v", live)
+	}
 }

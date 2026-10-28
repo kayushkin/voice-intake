@@ -638,12 +638,14 @@ type LatencySample struct {
 	ResultAtMs               *int64
 }
 
-// LatencySamples returns every dispatched session, measured from the speech
-// end of the last segment its text holds.
+// LatencySamples returns every dispatched session of live speech, measured
+// from the speech end of the last segment its text holds. Replays are left
+// out: they are compared by configuration.
 func (s *Store) LatencySamples() ([]LatencySample, error) {
 	rows, err := s.db.Query(`SELECT u.strategy, u.trigger, us.pooled, us.segment_indexes, us.dispatch_started_at_ms, us.dispatched_at_ms,
 		us.first_block_at_ms, us.result_at_ms, us.utterance_id
-		FROM utterance_sessions us JOIN utterances u ON u.utterance_id = us.utterance_id`)
+		FROM utterance_sessions us JOIN utterances u ON u.utterance_id = us.utterance_id
+		WHERE u.replay_id = ''`)
 	if err != nil {
 		return nil, err
 	}
