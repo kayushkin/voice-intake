@@ -571,6 +571,37 @@ func TestARepeatedSegmentIndexAndARepeatedUtteranceAreIgnored(t *testing.T) {
 	}
 }
 
+// A typed question is an utterance with trigger keyboard and one text
+// segment; it is dispatched like a spoken one and shows as its own group in
+// the latency table.
+func TestATypedQuestionIsDispatchedAndGroupedUnderTheKeyboardTrigger(t *testing.T) {
+	h := newHarness(t, nil)
+	now := time.Now().UnixMilli()
+	status, answer := h.call("POST", "/api/voice/utterances", map[string]any{"client_utterance_id": "typed", "mode": "quick", "strategy": "manual",
+		"trigger": "keyboard", "speech_started_at_ms": now}, testPrincipal)
+	if status != http.StatusCreated {
+		t.Fatalf("create typed utterance = %d %v; want 201", status, answer)
+	}
+	utteranceID := answer["utterance_id"].(string)
+	h.postSegment(utteranceID, 0, "what time is it in Lisbon", now)
+	h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal)
+	events := h.followUntilDone(utteranceID)
+	sawResult := false
+	for _, event := range events {
+		if event.name == eventSessionEvent {
+			sawResult = true
+		}
+	}
+	if !sawResult {
+		t.Fatalf("typed question streamed no session event: %v", events)
+	}
+	_, latency := h.call("GET", "/api/voice/latency?group_by=trigger", nil, testPrincipal)
+	groups, _ := latency["groups"].([]any)
+	if len(groups) != 1 || groups[0].(map[string]any)["group"] != "keyboard" {
+		t.Fatalf("latency by trigger = %v; want one group, keyboard", latency)
+	}
+}
+
 func TestCancelStopsEverySessionTheUtteranceStarted(t *testing.T) {
 	h := newHarness(t, nil)
 	h.bridge.resultWait = time.Hour

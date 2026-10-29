@@ -23,7 +23,7 @@ var (
 	utteranceModes      = map[string]bool{"quick": true, "long": true}
 	utteranceStrategies = map[string]bool{"endpoint": true, "eager": true, "manual": true}
 	utteranceTriggers   = map[string]bool{"tile": true, "widget": true, "side_key": true, "assistant": true, "accessibility": true,
-		"shortcut": true, "app": true, "notification": true}
+		"shortcut": true, "app": true, "notification": true, "keyboard": true}
 	audioContentTypes = map[string]bool{"audio/wav": true, "audio/ogg": true, "audio/flac": true}
 )
 
