@@ -602,6 +602,45 @@ func TestATypedQuestionIsDispatchedAndGroupedUnderTheKeyboardTrigger(t *testing.
 	}
 }
 
+// detail=record makes each row of the list the full record, segments and
+// sessions with their timings, as GET /api/voice/utterances/{id} answers.
+func TestTheListWithDetailRecordCarriesSegmentsAndSessions(t *testing.T) {
+	h := newHarness(t, nil)
+	utteranceID := h.createUtterance("listed")
+	now := time.Now().UnixMilli()
+	h.postSegment(utteranceID, 0, "what's on today", now)
+	h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal)
+	h.followUntilDone(utteranceID)
+
+	listWithDetail := func(detail string) (int, []byte) {
+		request, err := http.NewRequest("GET", h.server.URL+"/api/voice/utterances?limit=5&detail="+detail, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("X-Principal-Id", testPrincipal)
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		raw, _ := io.ReadAll(response.Body)
+		return response.StatusCode, raw
+	}
+	status, raw := listWithDetail("record")
+	var rows []map[string]any
+	if err := json.Unmarshal(raw, &rows); status != 200 || err != nil || len(rows) != 1 {
+		t.Fatalf("list with detail=record = %d %s", status, raw)
+	}
+	segments, _ := rows[0]["segments"].([]any)
+	sessions, _ := rows[0]["sessions"].([]any)
+	if len(segments) != 1 || len(sessions) != 1 || sessions[0].(map[string]any)["dispatched_at_ms"] == nil {
+		t.Fatalf("row = %v; want one segment and one dispatched session", rows[0])
+	}
+	if status, _ := listWithDetail("everything"); status != http.StatusBadRequest {
+		t.Fatalf("detail=everything = %d, want 400", status)
+	}
+}
+
 func TestCancelStopsEverySessionTheUtteranceStarted(t *testing.T) {
 	h := newHarness(t, nil)
 	h.bridge.resultWait = time.Hour

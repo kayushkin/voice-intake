@@ -300,12 +300,51 @@ func (s *Server) listUtterances(w http.ResponseWriter, r *http.Request) {
 		}
 		limit = parsed
 	}
+	detail := r.URL.Query().Get("detail")
+	if detail != "" && detail != "record" {
+		writeError(w, http.StatusBadRequest, "detail must be left out or be record")
+		return
+	}
 	utterances, err := s.store.ListUtterances(principalOf(r), limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, utterances)
+	if detail == "" {
+		writeJSON(w, http.StatusOK, utterances)
+		return
+	}
+	// detail=record: each row as GET /api/voice/utterances/{id} answers it,
+	// so the phone's status page needs one call, not one per utterance.
+	records := make([]UtteranceRecord, 0, len(utterances))
+	for _, utterance := range utterances {
+		record, err := s.utteranceRecord(utterance)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		records = append(records, record)
+	}
+	writeJSON(w, http.StatusOK, records)
+}
+
+// utteranceRecord gathers an utterance's segments, sessions, decisions and
+// judgments: GET /api/voice/utterances/{id}, and each row of the list with
+// detail=record.
+func (s *Server) utteranceRecord(utterance Utterance) (UtteranceRecord, error) {
+	record := UtteranceRecord{Utterance: utterance}
+	var err error
+	if record.Segments, err = s.store.Segments(utterance.UtteranceID); err != nil {
+		return record, err
+	}
+	if record.Sessions, err = s.store.UtteranceSessions(utterance.UtteranceID); err != nil {
+		return record, err
+	}
+	if record.Decisions, err = s.store.Decisions(utterance.UtteranceID); err != nil {
+		return record, err
+	}
+	record.ContinuationJudgments, err = s.store.ContinuationJudgments(utterance.UtteranceID)
+	return record, err
 }
 
 // UtteranceRecord is GET /api/voice/utterances/{id}.
@@ -322,15 +361,7 @@ func (s *Server) getUtterance(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	record := UtteranceRecord{Utterance: utterance}
-	var err error
-	if record.Segments, err = s.store.Segments(utterance.UtteranceID); err == nil {
-		if record.Sessions, err = s.store.UtteranceSessions(utterance.UtteranceID); err == nil {
-			if record.Decisions, err = s.store.Decisions(utterance.UtteranceID); err == nil {
-				record.ContinuationJudgments, err = s.store.ContinuationJudgments(utterance.UtteranceID)
-			}
-		}
-	}
+	record, err := s.utteranceRecord(utterance)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
