@@ -103,14 +103,16 @@ fi
 BASE="http://${ADDR}"
 curl -sfS "$BASE/health" >/dev/null || { echo "ERROR: /health did not answer"; exit 1; }
 curl -sfS "$BASE/settings" >/dev/null || { echo "ERROR: /settings did not answer"; exit 1; }
-# A route behind the principal gate, with a principal that names nobody: it
-# proves the gate and the stored settings answer without touching anyone's data.
-curl -sfS -H 'X-Principal-Id: deploy-smoke-check' "$BASE/api/voice/settings" >/dev/null || { echo "ERROR: /api/voice/settings did not answer"; exit 1; }
+# A route behind the principal gate, with a principal that names nobody: a
+# 403 proves the gate asked principal-store and principal-store answered (it
+# would be 502 if principal-store were down), without touching anyone's data.
+code="$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Principal-Id: deploy-smoke-check' "$BASE/api/voice/settings")"
+[ "$code" = "403" ] || { echo "ERROR: /api/voice/settings with a principal principal-store does not have answered $code, want 403"; exit 1; }
 code="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/voice/settings")"
 [ "$code" = "401" ] || { echo "ERROR: /api/voice/settings without X-Principal-Id answered $code, want 401"; exit 1; }
 code="$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/admin/app/releases")"
 [ "$code" = "401" ] || { echo "ERROR: /admin/app/releases without the publish token answered $code, want 401"; exit 1; }
-echo "    /health, /settings and /api/voice/settings answered, and the principal and publish gates refused bare calls"
+echo "    /health and /settings answered, and the principal and publish gates refused bare calls and an unknown principal"
 
 # The bind is part of the contract: the service trusts X-Principal-Id from
 # loopback and must not be reachable off-host. Fail the deploy if it is listening anywhere else.
