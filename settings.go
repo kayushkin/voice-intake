@@ -29,6 +29,7 @@ const (
 	SettingLLMBridgeURL            = "llm_bridge_url"
 	SettingLLMBridgeServiceToken   = "llm_bridge_service_token"
 	SettingModelStoreURL           = "model_store_url"
+	SettingPrincipalStoreURL       = "principal_store_url"
 	SettingSessionWorkingDirectory = "session_working_directory"
 	SettingRaisedEffort            = "raised_effort"
 	SettingTranscribers            = "transcribers"
@@ -86,6 +87,8 @@ func SettingDefinitions() []servicesettings.Definition {
 			Description: "llm-bridge-server's service token, sent as X-LLM-Bridge-Service-Token, with X-Principal-Id naming the person when a session is created for them."},
 		{Key: SettingModelStoreURL, EnvironmentVariable: "VOICE_INTAKE_MODEL_STORE_URL", Kind: wiring, ValueType: text, Default: "http://127.0.0.1:8155",
 			Description: "Where model-store answers: a new continuation_judge_model_role is checked against its roles and a new default_model against its models."},
+		{Key: SettingPrincipalStoreURL, EnvironmentVariable: "VOICE_INTAKE_PRINCIPAL_STORE_URL", Kind: wiring, ValueType: text, Default: "http://127.0.0.1:8314",
+			Description: "Where principal-store answers: every X-Principal-Id, and every person whose pool is filled at start, must be an enabled principal there."},
 		{Key: SettingSessionWorkingDirectory, EnvironmentVariable: "VOICE_INTAKE_SESSION_WORKING_DIR", Kind: path, ValueType: text,
 			Description: "The working directory of every voice session. The prompt a voice session reads is the project prompt collection rooted here. Empty leaves the instance's own directory."},
 		{Key: SettingTranscribers, EnvironmentVariable: "VOICE_INTAKE_TRANSCRIBERS", Kind: wiring, ValueType: msg.ServiceSettingValueTypeStringMap,

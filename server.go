@@ -50,11 +50,14 @@ type Server struct {
 	appReleaseDirectory string
 	// appReleasePublishToken is what the admin route demands to publish one.
 	appReleasePublishToken string
+	// principals checks every X-Principal-Id with principal-store.
+	principals PrincipalVerifier
 }
 
 // NewServer builds the API.
-func NewServer(store *Store, dispatcher *Dispatcher, pool *SessionPool, registry *servicesettings.Registry, transcribers Transcribers, now func() time.Time) *Server {
-	return &Server{store: store, dispatcher: dispatcher, pool: pool, registry: registry, transcribers: transcribers, now: now,
+func NewServer(store *Store, dispatcher *Dispatcher, pool *SessionPool, registry *servicesettings.Registry, transcribers Transcribers,
+	principals PrincipalVerifier, now func() time.Time) *Server {
+	return &Server{store: store, dispatcher: dispatcher, pool: pool, registry: registry, transcribers: transcribers, principals: principals, now: now,
 		settingValidators: map[string]func(ctx context.Context, value string) error{}}
 }
 
@@ -90,7 +93,7 @@ func (s *Server) Handler() http.Handler {
 	voice.HandleFunc("GET /api/voice/replays/{replay_id}", s.getReplay)
 	voice.HandleFunc("GET /api/voice/app/releases/latest", s.latestAppRelease)
 	voice.HandleFunc("GET /api/voice/app/releases/{version_code}/apk", s.downloadAppRelease)
-	mux.Handle("/api/voice/", requirePrincipalFromLoopback(voice))
+	mux.Handle("/api/voice/", s.requireKnownPrincipalFromLoopback(voice))
 	// Not under /api/voice/, so dash does not carry it: a build machine on
 	// this host publishes the phone app's releases here.
 	mux.HandleFunc("POST /admin/app/releases", s.requirePublishTokenFromLoopback(s.publishAppRelease))
@@ -100,9 +103,10 @@ func (s *Server) Handler() http.Handler {
 
 type principalContextKey struct{}
 
-// requirePrincipalFromLoopback trusts X-Principal-Id only on a request from
-// this host, which is how dash, the front door, reaches the service.
-func requirePrincipalFromLoopback(next http.Handler) http.Handler {
+// requireKnownPrincipalFromLoopback trusts X-Principal-Id only on a request
+// from this host, which is how dash, the front door, reaches the service, and
+// only when principal-store has that principal and it is enabled.
+func (s *Server) requireKnownPrincipalFromLoopback(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil || !net.ParseIP(host).IsLoopback() {
@@ -112,6 +116,14 @@ func requirePrincipalFromLoopback(next http.Handler) http.Handler {
 		principalID := strings.TrimSpace(r.Header.Get("X-Principal-Id"))
 		if principalID == "" {
 			writeError(w, http.StatusUnauthorized, "X-Principal-Id is required; dash sets it for the signed-in person")
+			return
+		}
+		if err := s.principals.VerifyPrincipal(r.Context(), principalID); err != nil {
+			if errors.Is(err, ErrUnknownPrincipal) || errors.Is(err, ErrDisabledPrincipal) {
+				writeError(w, http.StatusForbidden, "X-Principal-Id: "+err.Error())
+				return
+			}
+			writeError(w, http.StatusBadGateway, "could not check X-Principal-Id: "+err.Error())
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principalID)))

@@ -39,7 +39,8 @@ func main() {
 	bridge := voiceintake.NewHTTPSessionBridge(bridgeURL, serviceToken)
 	judge := voiceintake.NewBridgeContinuationJudge(bridgeURL, serviceToken)
 	settings := func() voiceintake.DispatchSettings { return voiceintake.DispatchSettingsFrom(registry) }
-	pool := voiceintake.NewSessionPool(store, bridge, settings, time.Now)
+	principals := voiceintake.NewPrincipalStoreVerifier(registry.String(voiceintake.SettingPrincipalStoreURL), time.Now)
+	pool := voiceintake.NewSessionPool(store, bridge, settings, principals, time.Now)
 	dispatcher := voiceintake.NewDispatcher(store, bridge, judge, pool, settings, time.Now, filepath.Join(dataDirectory, "audio"))
 	transcribers := voiceintake.Transcribers{}
 	for name, inferenceURL := range registry.StringMap(voiceintake.SettingTranscribers) {
@@ -53,7 +54,7 @@ func main() {
 	}
 	dispatcher.SetSpeechServices(detector, transcribers)
 	dispatcher.SetReplayRecordingDirectory(filepath.Join(dataDirectory, "replay-recordings"))
-	server := voiceintake.NewServer(store, dispatcher, pool, registry, transcribers, time.Now)
+	server := voiceintake.NewServer(store, dispatcher, pool, registry, transcribers, principals, time.Now)
 	server.SetAppReleaseDirectory(filepath.Join(dataDirectory, "app-releases"))
 	server.SetAppReleasePublishToken(registry.String(voiceintake.SettingAppReleasePublishToken))
 

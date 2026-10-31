@@ -19,7 +19,9 @@ Go, SQLite, `llm-bridge/servicesettings` for configuration. MIT licence.
 The phone reaches the service through a front door that checks the person's
 sign-in and adds `X-Principal-Id`. The service takes requests only from
 loopback, and every `/api/voice/` route needs `X-Principal-Id` (401 without
-it). An utterance belonging to another principal is a 404.
+it) naming an enabled principal in principal-store (403 for an unknown or
+disabled one, 502 when principal-store does not answer). An utterance
+belonging to another principal is a 404.
 
 Every phone request carries `X-Client-Now-Ms` (the phone's clock in epoch
 milliseconds). The service takes server time minus that as the clock skew of

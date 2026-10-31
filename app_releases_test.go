@@ -29,7 +29,8 @@ func newAppReleaseServer(t *testing.T, publishToken string) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	server := NewServer(store, nil, nil, registry, nil, time.Now)
+	_, principalStoreAddress := newFakePrincipalStore(t, knownTestPrincipals())
+	server := NewServer(store, nil, nil, registry, nil, NewPrincipalStoreVerifier(principalStoreAddress, time.Now), time.Now)
 	server.SetAppReleaseDirectory(directory + "/app-releases")
 	server.SetAppReleasePublishToken(publishToken)
 	httpServer := httptest.NewServer(server.Handler())

@@ -258,6 +258,7 @@ type harness struct {
 	bridge   *fakeBridge
 	judge    *fakeJudge
 	pool     *SessionPool
+	store    *Store
 	server   *httptest.Server
 	detector *fakeDetector
 }
@@ -298,7 +299,9 @@ func newHarnessWithTranscribers(t *testing.T, environment map[string]string, ext
 	bridge := newFakeBridge()
 	judge := &fakeJudge{continues: map[string]bool{"in São Paulo": true, "can you add cheese to my burger": false}, delay: 30 * time.Millisecond}
 	settings := func() DispatchSettings { return DispatchSettingsFrom(registry) }
-	pool := NewSessionPool(store, bridge, settings, time.Now)
+	_, principalStoreAddress := newFakePrincipalStore(t, knownTestPrincipals())
+	principals := NewPrincipalStoreVerifier(principalStoreAddress, time.Now)
+	pool := NewSessionPool(store, bridge, settings, principals, time.Now)
 	dispatcher := NewDispatcher(store, bridge, judge, pool, settings, time.Now, directory+"/audio")
 	detector := newFakeDetector()
 	transcribers := Transcribers{"fake": transcriber}
@@ -307,11 +310,11 @@ func newHarnessWithTranscribers(t *testing.T, environment map[string]string, ext
 	}
 	dispatcher.SetSpeechServices(detector, transcribers)
 	dispatcher.SetReplayRecordingDirectory(directory + "/replay-recordings")
-	server := NewServer(store, dispatcher, pool, registry, transcribers, time.Now)
+	server := NewServer(store, dispatcher, pool, registry, transcribers, principals, time.Now)
 	registry.OnChange(func(string) { pool.Resync(context.Background()) })
 	httpServer := httptest.NewServer(server.Handler())
 	t.Cleanup(httpServer.Close)
-	return &harness{t: t, bridge: bridge, judge: judge, pool: pool, server: httpServer, detector: detector}
+	return &harness{t: t, bridge: bridge, judge: judge, pool: pool, store: store, server: httpServer, detector: detector}
 }
 
 func (h *harness) call(method, path string, body any, principalID string) (int, map[string]any) {

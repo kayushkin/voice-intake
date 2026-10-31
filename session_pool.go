@@ -28,13 +28,16 @@ type SessionPool struct {
 	waiting  map[string][]PooledSession
 	creating map[string]int
 	known    map[string]bool
+	// principals is asked at start about every person with utterances, so
+	// an id principal-store does not have gets no pool.
+	principals PrincipalVerifier
 	// filling is held while sessions are created, so tests can wait for it.
 	filling sync.WaitGroup
 }
 
 // NewSessionPool builds an empty pool.
-func NewSessionPool(store *Store, bridge SessionBridge, settings func() DispatchSettings, now func() time.Time) *SessionPool {
-	return &SessionPool{store: store, bridge: bridge, settings: settings, now: now,
+func NewSessionPool(store *Store, bridge SessionBridge, settings func() DispatchSettings, principals PrincipalVerifier, now func() time.Time) *SessionPool {
+	return &SessionPool{store: store, bridge: bridge, settings: settings, principals: principals, now: now,
 		waiting: map[string][]PooledSession{}, creating: map[string]int{}, known: map[string]bool{}}
 }
 
@@ -54,12 +57,20 @@ func (pool *SessionPool) Restore(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var verified []string
+	for _, principalID := range principals {
+		if err := pool.principals.VerifyPrincipal(ctx, principalID); err != nil {
+			log.Printf("[pool] no pool for %q: %v", principalID, err)
+			continue
+		}
+		verified = append(verified, principalID)
+	}
 	pool.mutex.Lock()
 	for _, session := range waiting {
 		pool.waiting[session.PrincipalID] = append(pool.waiting[session.PrincipalID], session)
 		pool.known[session.PrincipalID] = true
 	}
-	for _, principalID := range principals {
+	for _, principalID := range verified {
 		pool.known[principalID] = true
 	}
 	pool.mutex.Unlock()
