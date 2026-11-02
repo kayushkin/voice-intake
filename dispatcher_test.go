@@ -40,12 +40,16 @@ type fakeBridge struct {
 	answers       []map[string]string
 	answerVia     string
 	chatCreated   []string
+
+	// states holds a session's bridge state where a test sets one; any
+	// other session reads idle.
+	states map[string]string
 }
 
 func newFakeBridge() *fakeBridge {
 	return &fakeBridge{sent: map[string][]string{}, renamed: map[string]string{}, shared: map[string][]string{},
 		streams: map[string]chan BridgeEvent{}, resultWait: 20 * time.Millisecond,
-		sessionOwners: map[string]string{}, personSent: map[string][]string{}, answerVia: "message"}
+		sessionOwners: map[string]string{}, personSent: map[string][]string{}, answerVia: "message", states: map[string]string{}}
 }
 
 func (b *fakeBridge) stream(sessionID string) chan BridgeEvent {
@@ -103,6 +107,11 @@ func (b *fakeBridge) RenameSession(ctx context.Context, sessionID, displayName s
 }
 
 func (b *fakeBridge) SessionState(ctx context.Context, sessionID string) (string, error) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	if state, set := b.states[sessionID]; set {
+		return state, nil
+	}
 	return "idle", nil
 }
 
@@ -813,5 +822,43 @@ func TestLatencyMediansGroupDispatchedSessions(t *testing.T) {
 	}
 	if status, _ := h.call("GET", "/api/voice/latency?group_by=model", nil, testPrincipal); status != http.StatusBadRequest {
 		t.Fatalf("unknown group_by = %d, want 400", status)
+	}
+}
+
+// A pooled session the bridge's idle reaper stopped reads completed. It never
+// had a turn, so the bridge cannot resume it: the utterance must go to a new
+// session and the stopped one must be given up.
+func TestAPooledSessionTheReaperStoppedIsGivenUpForANewSession(t *testing.T) {
+	h := newHarness(t, map[string]string{"VOICE_INTAKE_POOL_SIZE": "1"})
+	h.pool.Fill(testPrincipal)
+	h.pool.WaitForFills()
+	_, ids, _, _ := h.bridge.snapshot()
+	if len(ids) != 1 {
+		t.Fatalf("the pool started %d sessions, want 1", len(ids))
+	}
+	stoppedByReaper := ids[0]
+	h.bridge.mutex.Lock()
+	h.bridge.states[stoppedByReaper] = "completed"
+	h.bridge.mutex.Unlock()
+
+	utteranceID := h.createUtterance("stopped-pooled-session")
+	now := time.Now().UnixMilli()
+	h.postSegment(utteranceID, 0, "add milk to my grocery list", now)
+	if status, answer := h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal); status != 200 {
+		t.Fatalf("finish = %d %v", status, answer)
+	}
+	h.followUntilDone(utteranceID)
+	h.pool.WaitForFills()
+
+	_, ids, sent, stopped := h.bridge.snapshot()
+	if len(sent[stoppedByReaper]) != 0 {
+		t.Fatalf("the words went to the stopped pooled session %s: %v", stoppedByReaper, sent[stoppedByReaper])
+	}
+	answered := sessionByText(t, ids, sent, "add milk to my grocery list")
+	if answered == stoppedByReaper {
+		t.Fatalf("the utterance went to the stopped pooled session %s", stoppedByReaper)
+	}
+	if !contains(stopped, stoppedByReaper) {
+		t.Fatalf("stopped = %v; want the stopped pooled session %s given up", stopped, stoppedByReaper)
 	}
 }

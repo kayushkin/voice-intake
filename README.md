@@ -133,9 +133,10 @@ words survive a restart of this service, with their own expiry.
 effort, model, instance and working directory, and titled "Voice: ready for
 speech" until text arrives and the session is renamed to it. A person's pool
 starts filling at their first utterance, and at start for everyone who has
-made one. A waiting session the bridge reports `aborted`, `error` or
-`disconnected` is given up; one the bridge's idle reaper stopped reads
-`completed` and is still used, since the bridge resumes it. Each session row
+made one. A waiting session the bridge reports `aborted`, `error`,
+`disconnected` or `completed` is given up. One the bridge's idle reaper
+stopped reads `completed`, and the bridge cannot resume it, since it never
+had a turn and its harness saved no conversation. Each session row
 records whether it was pooled and the state the pooled session was in, so
 pooled and fresh sessions can be compared. Changing a setting the pool
 depends on gives up the waiting sessions that no longer match.

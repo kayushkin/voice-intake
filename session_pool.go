@@ -14,8 +14,11 @@ const pooledSessionDisplayName = "Voice: ready for speech"
 
 // sessionStatesThatCannotTakeAMessage are the bridge states in which a
 // pooled session is given up rather than used. A session the idle reaper
-// stopped reads completed and still takes a message: the bridge resumes it.
-var sessionStatesThatCannotTakeAMessage = map[string]bool{"aborted": true, "error": true, "disconnected": true}
+// stopped reads completed and cannot take one either: a pooled session has
+// never had a turn, so its harness saved no conversation, and the bridge's
+// resume fails ("No conversation found with session ID"), which loses the
+// person's words.
+var sessionStatesThatCannotTakeAMessage = map[string]bool{"aborted": true, "error": true, "disconnected": true, "completed": true}
 
 // SessionPool keeps pool_size started sessions waiting per person.
 type SessionPool struct {
