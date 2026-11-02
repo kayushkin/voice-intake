@@ -33,7 +33,7 @@ const (
 )
 
 func settingDefinitions() []servicesettings.Definition {
-	wiring, path, behaviour := msg.ServiceSettingKindWiring, msg.ServiceSettingKindPath, msg.ServiceSettingKindBehaviour
+	wiring, path, behaviour := msg.ServiceSettingKindWiring, msg.ServiceSettingKindPath, msg.ServiceSettingKindBehavior
 	text, integer := msg.ServiceSettingValueTypeString, msg.ServiceSettingValueTypeInteger
 	return []servicesettings.Definition{
 		{Key: settingListenAddress, EnvironmentVariable: "SPEECH_SERVER_ADDR", Kind: wiring, ValueType: text, Default: "127.0.0.1:8335",

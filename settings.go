@@ -74,7 +74,7 @@ func DefaultDataDir() string {
 // SettingDefinitions declares every environment variable the service reads,
 // once.
 func SettingDefinitions() []servicesettings.Definition {
-	wiring, path, secret, behaviour := msg.ServiceSettingKindWiring, msg.ServiceSettingKindPath, msg.ServiceSettingKindSecret, msg.ServiceSettingKindBehaviour
+	wiring, path, secret, behaviour := msg.ServiceSettingKindWiring, msg.ServiceSettingKindPath, msg.ServiceSettingKindSecret, msg.ServiceSettingKindBehavior
 	text, integer, list, role := msg.ServiceSettingValueTypeString, msg.ServiceSettingValueTypeInteger, msg.ServiceSettingValueTypeStringList, msg.ServiceSettingValueTypeModelRole
 	return []servicesettings.Definition{
 		{Key: SettingListenAddress, EnvironmentVariable: "VOICE_INTAKE_ADDR", Kind: wiring, ValueType: text, Default: DefaultListenAddress,
