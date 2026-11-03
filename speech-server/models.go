@@ -52,7 +52,7 @@ import (
 
 func init() { C.quietLibraries() }
 
-// Word is one recognised word and where it lies in the audio.
+// Word is one recognized word and where it lies in the audio.
 type Word struct {
 	Text    string `json:"word"`
 	StartMs int64  `json:"start_ms"`

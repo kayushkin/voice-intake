@@ -8,7 +8,7 @@ import (
 
 // Where an utterance's words go: the target on POST /api/voice/utterances.
 const (
-	// TargetPool is today's behaviour and the default: a pooled voice
+	// TargetPool is today's behavior and the default: a pooled voice
 	// session, or a fresh one like it, with segments split and judged.
 	TargetPool = "pool"
 	// TargetNewSession starts an ordinary chat session, as the chat's New

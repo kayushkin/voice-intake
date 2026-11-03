@@ -37,7 +37,7 @@ func OpenStore(dataDirectory string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
-	// One connection: writes are small and serialised, and minting an id
+	// One connection: writes are small and serialized, and minting an id
 	// from MAX(sequence) stays safe.
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
@@ -162,7 +162,7 @@ type Utterance struct {
 	EndedAtMs               *int64   `json:"ended_at_ms"`
 	FinishedAtMs            *int64   `json:"finished_at_ms"`
 	FinalizedAtMs           *int64   `json:"finalized_at_ms"`
-	CancelledAtMs           *int64   `json:"cancelled_at_ms"`
+	CanceledAtMs            *int64   `json:"cancelled_at_ms"`
 	AudioFilename           string   `json:"audio_filename"`
 	AudioContentType        string   `json:"audio_content_type"`
 	AudioSizeBytes          int64    `json:"audio_size_bytes"`
@@ -182,7 +182,7 @@ type Utterance struct {
 	// ConfirmBeforeSend holds the joined words for the person to confirm
 	// before anything is sent (targets session, signal and new_session).
 	// ConfirmationState is empty until words are held, then awaiting, and
-	// at last confirmed, cancelled or expired.
+	// at last confirmed, canceled or expired.
 	ConfirmBeforeSend        bool   `json:"confirm_before_send"`
 	ConfirmationState        string `json:"confirmation_state"`
 	ConfirmationText         string `json:"confirmation_text"`
@@ -194,7 +194,7 @@ type Utterance struct {
 const (
 	ConfirmationAwaiting  = "awaiting"
 	ConfirmationConfirmed = "confirmed"
-	ConfirmationCancelled = "cancelled"
+	ConfirmationCanceled  = "cancelled"
 	ConfirmationExpired   = "expired"
 )
 
@@ -316,7 +316,7 @@ func scanUtterance(row rowScanner) (Utterance, error) {
 	err := row.Scan(&utterance.UtteranceID, &utterance.ClientUtteranceID, &utterance.PrincipalID,
 		&utterance.Mode, &utterance.Strategy, &utterance.Trigger,
 		&utterance.SpeechStartedAtClientMs, &utterance.SpeechStartedAtMs, &utterance.ClientClockSkewMs, &utterance.ReceivedAtMs,
-		&utterance.EndedAtClientMs, &utterance.EndedAtMs, &utterance.FinishedAtMs, &utterance.FinalizedAtMs, &utterance.CancelledAtMs,
+		&utterance.EndedAtClientMs, &utterance.EndedAtMs, &utterance.FinishedAtMs, &utterance.FinalizedAtMs, &utterance.CanceledAtMs,
 		&utterance.AudioFilename, &utterance.AudioContentType, &utterance.AudioSizeBytes, &utterance.AudioReceivedAtMs, &errorsJSON,
 		&utterance.AudioStreaming, &utterance.AudioFormat, &utterance.StreamReceivedBytes, &utterance.StopRecordingReason, &utterance.StopRecordingSentAtMs,
 		&utterance.StoppedAtClientMs, &utterance.StoppedAtMs, &utterance.StopReason, &utterance.ReplayID,
@@ -443,8 +443,8 @@ func (s *Store) MarkUtteranceFinalized(utteranceID string, atMs int64) error {
 	return s.exec(`UPDATE utterances SET finalized_at_ms = ? WHERE utterance_id = ? AND finalized_at_ms IS NULL`, atMs, utteranceID)
 }
 
-// MarkUtteranceCancelled records a cancel.
-func (s *Store) MarkUtteranceCancelled(utteranceID string, atMs int64) error {
+// MarkUtteranceCanceled records a cancel.
+func (s *Store) MarkUtteranceCanceled(utteranceID string, atMs int64) error {
 	return s.exec(`UPDATE utterances SET cancelled_at_ms = ? WHERE utterance_id = ? AND cancelled_at_ms IS NULL`, atMs, utteranceID)
 }
 

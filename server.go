@@ -409,8 +409,8 @@ func (s *Server) postSegment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if utterance.CancelledAtMs != nil {
-		writeError(w, http.StatusConflict, utterance.UtteranceID+" was cancelled")
+	if utterance.CanceledAtMs != nil {
+		writeError(w, http.StatusConflict, utterance.UtteranceID+" was canceled")
 		return
 	}
 	segment := Segment{UtteranceID: utterance.UtteranceID, Index: *body.Index, Text: body.Text, SpeechEndedAtClientMs: *body.SpeechEndedAtMs,
@@ -469,8 +469,8 @@ func (s *Server) postSegmentAudio(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnsupportedMediaType, fmt.Sprintf("Content-Type %q: this route takes audio/wav, 16 kHz mono 16-bit PCM", contentType))
 		return
 	}
-	if utterance.CancelledAtMs != nil {
-		writeError(w, http.StatusConflict, utterance.UtteranceID+" was cancelled")
+	if utterance.CanceledAtMs != nil {
+		writeError(w, http.StatusConflict, utterance.UtteranceID+" was canceled")
 		return
 	}
 	alreadyReceived := func() {
@@ -598,8 +598,8 @@ func (s *Server) postAudioStream(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, utterance.UtteranceID+" was not made with audio_streaming true")
 		return
 	}
-	if utterance.CancelledAtMs != nil {
-		writeError(w, http.StatusConflict, utterance.UtteranceID+" was cancelled")
+	if utterance.CanceledAtMs != nil {
+		writeError(w, http.StatusConflict, utterance.UtteranceID+" was canceled")
 		return
 	}
 	offset, err := strconv.ParseInt(r.URL.Query().Get("offset_bytes"), 10, 64)

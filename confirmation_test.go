@@ -60,7 +60,7 @@ func TestASessionTargetHoldsItsWordsUntilTheyAreConfirmed(t *testing.T) {
 	}
 }
 
-func TestCancellingHeldWordsSendsNothing(t *testing.T) {
+func TestCancelingHeldWordsSendsNothing(t *testing.T) {
 	h := newHarness(t, nil)
 	h.bridge.ownSession("br_mine", testPrincipal)
 	utteranceID := h.createHeldUtterance("held-cancel", map[string]any{"kind": "session", "session_id": "br_mine"})
@@ -71,7 +71,7 @@ func TestCancellingHeldWordsSendsNothing(t *testing.T) {
 		t.Fatalf("cancel = %d %v", status, answer)
 	}
 	events := h.followUntilDone(utteranceID)
-	if ended := eventsNamed(events, eventConfirmationEnded); len(ended) != 1 || ended[0].data["state"] != ConfirmationCancelled {
+	if ended := eventsNamed(events, eventConfirmationEnded); len(ended) != 1 || ended[0].data["state"] != ConfirmationCanceled {
 		t.Fatalf("confirmation_ended = %v", ended)
 	}
 	if status, _ := h.confirm(utteranceID, nil); status != http.StatusConflict {

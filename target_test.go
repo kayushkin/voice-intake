@@ -117,7 +117,7 @@ func TestASessionTargetGetsOneMessageAfterFinishAndOnlyItsNewReply(t *testing.T)
 	}
 }
 
-func TestCancellingASessionTargetLeavesThePersonsSessionAlone(t *testing.T) {
+func TestCancelingASessionTargetLeavesThePersonsSessionAlone(t *testing.T) {
 	h := newHarness(t, nil)
 	h.bridge.ownSession("br_mine", testPrincipal)
 	_, answer := h.createTargetedUtterance("cancel-1", map[string]any{"kind": "session", "session_id": "br_mine"})
@@ -137,7 +137,7 @@ func TestASignalTargetAnswersEveryQuestionOfItsGroupWithTheWords(t *testing.T) {
 	h := newHarness(t, nil)
 	h.bridge.ownSession("br_asking", testPrincipal)
 	h.bridge.openSignals = []bridgeSignal{
-		{ID: "sig_first", SessionID: "br_asking", Kind: "question", RequestID: "dqgroup_1", Title: "Which colour?", State: "open"},
+		{ID: "sig_first", SessionID: "br_asking", Kind: "question", RequestID: "dqgroup_1", Title: "Which color?", State: "open"},
 		{ID: "sig_second", SessionID: "br_asking", Kind: "question", RequestID: "dqgroup_1", Title: "Which size?", State: "open"},
 		{ID: "sig_note", SessionID: "br_asking", Kind: "notification", Title: "Done", State: "open"},
 	}

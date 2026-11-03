@@ -12,7 +12,7 @@ earlier request or is a request of its own. It stops the sessions it does not
 keep. Every session is created as the person, so each request is a real
 conversation in that person's chat.
 
-Go, SQLite, `llm-bridge/servicesettings` for configuration. MIT licence.
+Go, SQLite, `llm-bridge/servicesettings` for configuration. MIT license.
 
 ## Routes
 
@@ -35,7 +35,7 @@ time with it. Both values are stored.
 | `POST /api/voice/utterances/{id}/segments/{index}/audio?speech_ended_at_ms=…` | body the segment's sound, `audio/wav`, 16 kHz mono 16-bit PCM; transcribed, then handled as a text segment with that index → 202 `{"text","transcription_ms","audio_duration_ms","status":"accepted"}`; no words → 200 `"status":"no words"`, stored, not dispatched; an index already received → 200, not transcribed; after cancel → 409; transcription failed → 502, nothing stored; no transcription service set → 503 (an addition: see *Contract changes*) |
 | `POST /api/voice/utterances/{id}/finish` | `{"ended_at_ms"}` → 200; decisions become final once every received segment is handled |
 | `POST /api/voice/utterances/{id}/cancel` | → 200; stops every session the utterance started, and discards words held for confirmation |
-| `POST /api/voice/utterances/{id}/confirm` | optional `{"text"}`, which must be the words held → 200 `{"utterance_id","status":"confirmed"}` and the words are sent; nothing held, or already confirmed, cancelled or expired → 409; other words → 409 (an addition: see *Confirmation*) |
+| `POST /api/voice/utterances/{id}/confirm` | optional `{"text"}`, which must be the words held → 200 `{"utterance_id","status":"confirmed"}` and the words are sent; nothing held, or already confirmed, canceled or expired → 409; other words → 409 (an addition: see *Confirmation*) |
 | `POST /api/voice/utterances/{id}/audio?filename=…` | body the bytes, `audio/wav`, `audio/ogg` or `audio/flac` → 200 `{"shared_into":[…]}`; kept in the data directory and shared into every session the utterance still keeps, and into any it starts later |
 | `GET /api/voice/utterances/{id}` | the row: segments, sessions with roles and timings, decisions, continuation judgments |
 | `GET /api/voice/utterances?limit=50` | the caller's utterances, newest first; with `detail=record` each row is the whole record as `GET /api/voice/utterances/{id}` answers it (segments, sessions, decisions, judgments); any other `detail` → 400 |
@@ -161,7 +161,7 @@ phone may send the same index again.
 ## Timings and latency
 
 All times are milliseconds since the epoch, server clock. Per utterance:
-speech start, received, finished, finalized, cancelled. Per segment: speech
+speech start, received, finished, finalized, canceled. Per segment: speech
 end, received, and for audio segments transcription started and ended
 (`transcription_ms` is the difference). Per session: dispatch started, dispatched (the send returned),
 first `block` event, `result` event, stopped. `GET /api/voice/latency?group_by=strategy|pooled|trigger|source` groups
@@ -284,7 +284,7 @@ which a client that ignores unknown fields and events has to handle:
 - A streamed segment carries `mean_speech_probability` and `voiced_ms`, and one too weakly heard to transcribe also `dropped_reason`, with empty `text`; its `event: transcript` carries the same `dropped_reason`. A replay configuration takes `high_pass_cutoff_hz` and `minimum_segment_mean_speech_probability`, zero (off) when left out.
 - A session in `GET /api/voice/utterances/{id}` carries `working_directory`, `reply_text` and `turn_cost_usd`.
 - Replay routes and `GET /api/voice/latency?group_by=configuration`, above. They are for measuring settings, not for the phone.
-- `POST /api/voice/utterances` takes an optional `target` (*Targets*, above): `pool` (the default and the behaviour before), `new_session`, `session` with `session_id`, or `signal` with `signal_id`; an unknown kind, a missing id or an id on the wrong kind is 400. Each utterance in `GET /api/voice/utterances/{id}` and the list carries `target` as stored, `{"kind":"pool"}` for one made without.
+- `POST /api/voice/utterances` takes an optional `target` (*Targets*, above): `pool` (the default and the behavior before), `new_session`, `session` with `session_id`, or `signal` with `signal_id`; an unknown kind, a missing id or an id on the wrong kind is 400. Each utterance in `GET /api/voice/utterances/{id}` and the list carries `target` as stored, `{"kind":"pool"}` for one made without.
 - Confirmation (*Confirmation*, above): `POST /api/voice/utterances` takes an optional `confirm_before_send` (off when left out; `true` holds the words of targets `session`, `signal` and `new_session`; `true` on the pool is 400). The new route `POST /api/voice/utterances/{id}/confirm`, the events `awaiting_confirmation` and `confirmation_ended`, and on each utterance `confirm_before_send`, `confirmation_state` (empty, `awaiting`, `confirmed`, `cancelled` or `expired`), `confirmation_text`, `confirmation_expires_at_ms` and `confirmation_resolved_at_ms`. Until 2026-10-28 the hold was on by default, and a client with no confirm screen had its words held until they expired unsent (app 0.6.2 on `utterance_000341`); it is now off unless asked for.
 - `GET /api/voice/app/releases/latest` and `GET /api/voice/app/releases/{version_code}/apk`: the phone app's updates (*Phone app releases*). The time field is `published_at_ms`, epoch milliseconds like every other time here.
 - `trigger` takes `keyboard` as well: a question the person typed instead of spoke. The phone creates the utterance (strategy `manual`, no streaming), posts the text as segment 0 and finishes it, so the reply streams on `/events` exactly as a spoken one does, and `GET /api/voice/latency?group_by=trigger` shows typed questions as their own group.

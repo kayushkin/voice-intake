@@ -33,7 +33,7 @@ const (
 )
 
 func settingDefinitions() []servicesettings.Definition {
-	wiring, path, behaviour := msg.ServiceSettingKindWiring, msg.ServiceSettingKindPath, msg.ServiceSettingKindBehavior
+	wiring, path, behavior := msg.ServiceSettingKindWiring, msg.ServiceSettingKindPath, msg.ServiceSettingKindBehavior
 	text, integer := msg.ServiceSettingValueTypeString, msg.ServiceSettingValueTypeInteger
 	return []servicesettings.Definition{
 		{Key: settingListenAddress, EnvironmentVariable: "SPEECH_SERVER_ADDR", Kind: wiring, ValueType: text, Default: "127.0.0.1:8335",
@@ -42,7 +42,7 @@ func settingDefinitions() []servicesettings.Definition {
 			Description: "A ggml Parakeet TDT model file, kept in memory and used by POST /inference."},
 		{Key: settingVADModel, EnvironmentVariable: "SPEECH_SERVER_VOICE_ACTIVITY_MODEL", Kind: path, ValueType: text, Required: true,
 			Description: "A ggml Silero VAD model file; each audio stream loads its own copy."},
-		{Key: settingThreads, EnvironmentVariable: "SPEECH_SERVER_THREADS", Kind: behaviour, ValueType: integer, Default: "4",
+		{Key: settingThreads, EnvironmentVariable: "SPEECH_SERVER_THREADS", Kind: behavior, ValueType: integer, Default: "4",
 			Description: "CPU threads one transcription uses."},
 	}
 }

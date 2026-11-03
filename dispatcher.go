@@ -145,7 +145,7 @@ type utteranceRun struct {
 	sessions    map[string]*runSession
 	order       []string
 	final       bool
-	cancelled   bool
+	canceled    bool
 	windowTimer *time.Timer
 	audio       *utteranceAudio
 	mode        string
@@ -231,7 +231,7 @@ func (run *utteranceRun) loadFromStore(utterance Utterance) error {
 		run.hub.publish(eventDecision, decisionEventData(decision.SessionID, decision.Role, decision.Reason))
 	}
 	run.final = utterance.FinalizedAtMs != nil
-	run.cancelled = utterance.CancelledAtMs != nil
+	run.canceled = utterance.CanceledAtMs != nil
 	// A target utterance that reached a session has had its one message.
 	run.targetDelivered = run.collectsOneMessage() && len(sessions) > 0
 	run.held = utterance.ConfirmationState != ""
@@ -317,7 +317,7 @@ func (d *Dispatcher) Finish(utterance Utterance) error {
 func (run *utteranceRun) holdForConfirmation() {
 	d := run.dispatcher
 	run.mutex.Lock()
-	if run.held || run.cancelled {
+	if run.held || run.canceled {
 		run.mutex.Unlock()
 		return
 	}
@@ -412,7 +412,7 @@ func (run *utteranceRun) sendHeldWords() {
 		return
 	}
 	run.mutex.Lock()
-	if run.targetDelivered || run.cancelled {
+	if run.targetDelivered || run.canceled {
 		run.mutex.Unlock()
 		return
 	}
@@ -446,7 +446,7 @@ func (d *Dispatcher) Cancel(utterance Utterance) error {
 	if err != nil {
 		return err
 	}
-	won, err := d.store.ResolveConfirmation(utterance.UtteranceID, ConfirmationCancelled, d.now().UnixMilli())
+	won, err := d.store.ResolveConfirmation(utterance.UtteranceID, ConfirmationCanceled, d.now().UnixMilli())
 	if err != nil {
 		return err
 	}
@@ -456,7 +456,7 @@ func (d *Dispatcher) Cancel(utterance Utterance) error {
 			run.confirmationTimer.Stop()
 		}
 		run.mutex.Unlock()
-		run.hub.publish(eventConfirmationEnded, map[string]any{"state": ConfirmationCancelled})
+		run.hub.publish(eventConfirmationEnded, map[string]any{"state": ConfirmationCanceled})
 	}
 	run.cancel()
 	return nil
@@ -477,9 +477,9 @@ func (run *utteranceRun) processReadySegments() {
 	for {
 		run.mutex.Lock()
 		segment, ready := run.segments[run.nextIndex]
-		cancelled := run.cancelled
+		canceled := run.canceled
 		run.mutex.Unlock()
-		if !ready || cancelled {
+		if !ready || canceled {
 			return
 		}
 		// A segment with no words (an audio segment whose transcript came
@@ -735,13 +735,13 @@ func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, tex
 	streamContext, cancelStream := context.WithTimeout(context.Background(), sessionTurnLimit)
 	session.cancelStream = cancelStream
 	run.mutex.Lock()
-	cancelled := run.cancelled
+	canceled := run.canceled
 	run.sessions[sessionID] = session
 	run.order = append(run.order, sessionID)
 	run.mutex.Unlock()
-	if cancelled {
-		run.stopSession(session, "the utterance was cancelled before its text was sent")
-		return nil, errors.New("cancelled")
+	if canceled {
+		run.stopSession(session, "the utterance was canceled before its text was sent")
+		return nil, errors.New("canceled")
 	}
 
 	connected, streamEnded := make(chan struct{}), make(chan struct{})
@@ -791,7 +791,7 @@ func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, tex
 func (run *utteranceRun) deliverToTarget() {
 	d := run.dispatcher
 	run.mutex.Lock()
-	if run.targetDelivered || run.cancelled {
+	if run.targetDelivered || run.canceled {
 		run.mutex.Unlock()
 		return
 	}
@@ -1165,11 +1165,11 @@ func (run *utteranceRun) finalize(why string) {
 func (run *utteranceRun) cancel() {
 	d := run.dispatcher
 	run.mutex.Lock()
-	if run.cancelled {
+	if run.canceled {
 		run.mutex.Unlock()
 		return
 	}
-	run.cancelled = true
+	run.canceled = true
 	if run.windowTimer != nil {
 		run.windowTimer.Stop()
 	}
@@ -1182,19 +1182,19 @@ func (run *utteranceRun) cancel() {
 	}
 	run.mutex.Unlock()
 	for _, session := range sessions {
-		run.stopSession(session, "cancelled")
+		run.stopSession(session, "canceled")
 	}
-	if err := d.store.MarkUtteranceCancelled(run.utteranceID, d.now().UnixMilli()); err != nil {
+	if err := d.store.MarkUtteranceCanceled(run.utteranceID, d.now().UnixMilli()); err != nil {
 		log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
 	}
 	run.checkDone()
 }
 
-// checkDone sends done once the utterance is cancelled, or its decisions are
+// checkDone sends done once the utterance is canceled, or its decisions are
 // final and every session not superseded has finished its turn.
 func (run *utteranceRun) checkDone() {
 	run.mutex.Lock()
-	ready := run.cancelled
+	ready := run.canceled
 	if run.final && !ready {
 		ready = true
 		for _, session := range run.sessions {
