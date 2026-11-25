@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +33,13 @@ type fakeBridge struct {
 	shared     map[string][]string
 	streams    map[string]chan BridgeEvent
 	resultWait time.Duration
+	// turns counts the messages sent to each session; interruptedTurns is
+	// the last turn of each that was interrupted, whose result never comes.
+	turns            map[string]int
+	interruptedTurns map[string]int
+	interrupted      []string
+	// interruptEndDelay is how long an interrupted turn takes to end.
+	interruptEndDelay time.Duration
 
 	// The person's own sessions and open signals, for target tests.
 	sessionOwners map[string]string
@@ -48,7 +56,7 @@ type fakeBridge struct {
 
 func newFakeBridge() *fakeBridge {
 	return &fakeBridge{sent: map[string][]string{}, renamed: map[string]string{}, shared: map[string][]string{},
-		streams: map[string]chan BridgeEvent{}, resultWait: 20 * time.Millisecond,
+		streams: map[string]chan BridgeEvent{}, resultWait: 20 * time.Millisecond, turns: map[string]int{}, interruptedTurns: map[string]int{}, interruptEndDelay: 30 * time.Millisecond,
 		sessionOwners: map[string]string{}, personSent: map[string][]string{}, answerVia: "message", states: map[string]string{}}
 }
 
@@ -71,16 +79,59 @@ func (b *fakeBridge) CreateSession(ctx context.Context, creation SessionCreation
 	return sessionID, nil
 }
 
+// fakeEvent builds a bridge event as llm-bridge-server shapes it: message_id
+// names the assistant message a block or result belongs to, and a
+// user_message carries its text under result.
+func fakeEvent(eventType, sessionID, messageID, text string) BridgeEvent {
+	data, _ := json.Marshal(map[string]any{"type": eventType, "bridge_session_id": sessionID, "message_id": messageID, "result": map[string]any{"text": text}})
+	return BridgeEvent{Type: eventType, Data: data}
+}
+
+// SendMessage answers as the bridge does: its own echo of the message at
+// once, the harness's echo after it, a block, and after resultWait the
+// result, unless the turn was interrupted first.
 func (b *fakeBridge) SendMessage(ctx context.Context, sessionID, text string) error {
 	b.mutex.Lock()
 	b.sent[sessionID] = append(b.sent[sessionID], text)
 	wait := b.resultWait
+	b.turns[sessionID]++
+	turn := b.turns[sessionID]
 	b.mutex.Unlock()
 	events := b.stream(sessionID)
+	messageID := fmt.Sprintf("msg_%s_%d", sessionID, turn)
 	go func() {
-		events <- BridgeEvent{Type: "block", Data: json.RawMessage(`{"type":"block","bridge_session_id":"` + sessionID + `"}`)}
+		events <- fakeEvent("user_message", sessionID, "", text)
+		events <- fakeEvent("user_message", sessionID, "", text)
+		events <- fakeEvent("block", sessionID, messageID, "")
 		time.Sleep(wait)
-		events <- BridgeEvent{Type: "result", Data: json.RawMessage(`{"type":"result","bridge_session_id":"` + sessionID + `","result":{"text":"answer to ` + strings.ReplaceAll(text, `"`, `'`) + `"}}`)}
+		b.mutex.Lock()
+		interrupted := b.interruptedTurns[sessionID] >= turn
+		b.mutex.Unlock()
+		if interrupted {
+			return
+		}
+		events <- fakeEvent("result", sessionID, messageID, "answer to "+text)
+	}()
+	return nil
+}
+
+// InterruptSession stops the turn the session is running. As the real
+// bridge does, the stopped turn then ends by itself, interruptEndDelay
+// later, with one more block and an empty result that carry its message
+// id: the reply the turn would have given never comes.
+func (b *fakeBridge) InterruptSession(ctx context.Context, sessionID string) error {
+	b.mutex.Lock()
+	b.interrupted = append(b.interrupted, sessionID)
+	turn := b.turns[sessionID]
+	b.interruptedTurns[sessionID] = turn
+	delay := b.interruptEndDelay
+	b.mutex.Unlock()
+	events := b.stream(sessionID)
+	messageID := fmt.Sprintf("msg_%s_%d", sessionID, turn)
+	go func() {
+		time.Sleep(delay)
+		events <- fakeEvent("block", sessionID, messageID, "")
+		events <- fakeEvent("result", sessionID, messageID, "")
 	}()
 	return nil
 }
@@ -242,30 +293,54 @@ func (b *fakeBridge) snapshot() (created []SessionCreation, ids []string, sent m
 	return append([]SessionCreation(nil), b.created...), append([]string(nil), b.createdIDs...), sent, append([]string(nil), b.stopped...)
 }
 
-// fakeJudge answers by the new text, after a delay like a real model's.
-type fakeJudge struct {
-	mutex     sync.Mutex
-	continues map[string]bool
-	asked     []string
-	delay     time.Duration
+// fakeAddresseeJudge says the words are for the assistant unless they hold
+// one of its notForAssistant phrases, after a delay like a real model's.
+type fakeAddresseeJudge struct {
+	mutex           sync.Mutex
+	notForAssistant []string
+	asked           []string
+	delay           time.Duration
+	failure         error
 }
 
-func (j *fakeJudge) Judge(ctx context.Context, modelRole, earlierText, newText string) (ContinuationVerdict, error) {
+func (j *fakeAddresseeJudge) Judge(ctx context.Context, modelRole, text string) (AddresseeVerdict, error) {
 	time.Sleep(j.delay)
 	j.mutex.Lock()
 	defer j.mutex.Unlock()
-	j.asked = append(j.asked, earlierText+" | "+newText)
-	continues, known := j.continues[newText]
-	if !known {
-		return ContinuationVerdict{}, fmt.Errorf("the fake judge has no answer for %q", newText)
+	j.asked = append(j.asked, text)
+	if j.failure != nil {
+		return AddresseeVerdict{}, j.failure
 	}
-	return ContinuationVerdict{Continues: continues, Reason: "fake", Model: "fake-model"}, nil
+	for _, phrase := range j.notForAssistant {
+		if strings.Contains(text, phrase) {
+			return AddresseeVerdict{ForAssistant: false, Reason: "talk with someone else", Model: "fake-model"}, nil
+		}
+	}
+	return AddresseeVerdict{ForAssistant: true, Reason: "a request", Model: "fake-model"}, nil
+}
+
+func (j *fakeAddresseeJudge) askedTexts() []string {
+	j.mutex.Lock()
+	defer j.mutex.Unlock()
+	return append([]string(nil), j.asked...)
+}
+
+func (b *fakeBridge) interruptedSessions() []string {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	return append([]string(nil), b.interrupted...)
+}
+
+func (b *fakeBridge) archivedSessions() []string {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	return append([]string(nil), b.archived...)
 }
 
 type harness struct {
 	t        *testing.T
 	bridge   *fakeBridge
-	judge    *fakeJudge
+	judge    *fakeAddresseeJudge
 	pool     *SessionPool
 	store    *Store
 	server   *httptest.Server
@@ -306,7 +381,7 @@ func newHarnessWithTranscribers(t *testing.T, environment map[string]string, ext
 	t.Cleanup(fakeWhisper.Close)
 	transcriber := NewWhisperServerTranscriber(fakeWhisper.URL + "/inference")
 	bridge := newFakeBridge()
-	judge := &fakeJudge{continues: map[string]bool{"in São Paulo": true, "can you add cheese to my burger": false}, delay: 30 * time.Millisecond}
+	judge := &fakeAddresseeJudge{notForAssistant: []string{"they went over it yesterday"}, delay: 30 * time.Millisecond}
 	settings := func() DispatchSettings { return DispatchSettingsFrom(registry) }
 	_, principalStoreAddress := newFakePrincipalStore(t, knownTestPrincipals())
 	principals := NewPrincipalStoreVerifier(principalStoreAddress, time.Now)
@@ -458,7 +533,41 @@ func contains(list []string, item string) bool {
 	return false
 }
 
-func TestAContinuingSegmentKeepsTheJoinedSessionAndSupersedesTheEarlierOne(t *testing.T) {
+// sessionEventTypes lists the types of the session events passed on, in
+// order.
+func sessionEventTypes(events []receivedEvent) []string {
+	var types []string
+	for _, event := range events {
+		if event.name == eventSessionEvent {
+			types = append(types, event.data["event"].(map[string]any)["type"].(string))
+		}
+	}
+	return types
+}
+
+func countOf(list []string, item string) int {
+	count := 0
+	for _, element := range list {
+		if element == item {
+			count++
+		}
+	}
+	return count
+}
+
+// waitFor polls until condition holds, or fails the test with what.
+func waitFor(t *testing.T, what string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestALaterSegmentGoesIntoTheSameSessionAsItsNextMessage(t *testing.T) {
 	h := newHarness(t, map[string]string{"VOICE_INTAKE_POOL_SIZE": "1"})
 	// Let the pool start its session before the first utterance takes it.
 	h.pool.Fill(testPrincipal)
@@ -467,6 +576,12 @@ func TestAContinuingSegmentKeepsTheJoinedSessionAndSupersedesTheEarlierOne(t *te
 	utteranceID := h.createUtterance("weather-sao-paulo")
 	now := time.Now().UnixMilli()
 	h.postSegment(utteranceID, 0, "what's the weather like", now-1500)
+	// The first reply is out before the person speaks again.
+	waitFor(t, "the first turn's result", func() bool {
+		_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+		sessions, _ := record["sessions"].([]any)
+		return len(sessions) == 1 && sessions[0].(map[string]any)["result_at_ms"] != nil
+	})
 	h.postSegment(utteranceID, 1, "in São Paulo", now)
 	if status, answer := h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal); status != 200 {
 		t.Fatalf("finish = %d %v", status, answer)
@@ -475,88 +590,253 @@ func TestAContinuingSegmentKeepsTheJoinedSessionAndSupersedesTheEarlierOne(t *te
 	h.pool.WaitForFills()
 
 	_, ids, sent, stopped := h.bridge.snapshot()
-	earlier := sessionByText(t, ids, sent, "what's the weather like")
-	joined := sessionByText(t, ids, sent, "what's the weather like in São Paulo")
-	alone := sessionByText(t, ids, sent, "in São Paulo")
-	roles := decisionsOf(events)
-	if roles[joined] != RoleKept || roles[earlier] != RoleSuperseded || roles[alone] != RoleSuperseded {
-		t.Fatalf("decisions = %v; want joined %s kept, earlier %s and alone %s superseded", roles, joined, earlier, alone)
+	conversation := ids[0]
+	if got := sent[conversation]; len(got) != 2 || got[0] != "what's the weather like" || got[1] != "in São Paulo" {
+		t.Fatalf("the pooled session %s was sent %v; want the two segments as two messages", conversation, got)
 	}
-	if !contains(stopped, earlier) || !contains(stopped, alone) || contains(stopped, joined) {
-		t.Fatalf("stopped = %v; want %s and %s stopped and %s running", stopped, earlier, alone, joined)
+	for _, id := range ids[1:] {
+		if len(sent[id]) != 0 {
+			t.Fatalf("a second session %s was sent %v: one press is one session", id, sent[id])
+		}
 	}
-	if earlier != ids[0] {
-		t.Fatalf("segment 0 went to %s, not the pooled session %s", earlier, ids[0])
+	if roles := decisionsOf(events); len(roles) != 1 || roles[conversation] != RoleKept {
+		t.Fatalf("decisions = %v; want only %s, kept", roles, conversation)
+	}
+	if len(stopped) != 0 || len(h.bridge.interruptedSessions()) != 0 {
+		t.Fatalf("stopped %v, interrupted %v; want neither: the first turn had finished", stopped, h.bridge.interruptedSessions())
+	}
+	if results := countOf(sessionEventTypes(events), "result"); results != 2 {
+		t.Fatalf("%d results passed on, want both turns': %v", results, sessionEventTypes(events))
+	}
+	followUps := eventsNamed(events, eventFollowUp)
+	if len(followUps) != 1 || followUps[0].data["text"] != "in São Paulo" || followUps[0].data["interrupted_reply"] != false {
+		t.Fatalf("follow_up events = %v", followUps)
 	}
 
-	status, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
-	if status != 200 {
-		t.Fatalf("get = %d", status)
-	}
+	_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
 	sessions := record["sessions"].([]any)
-	var sawPooled bool
-	for _, raw := range sessions {
-		session := raw.(map[string]any)
-		if session["session_id"] == earlier {
-			sawPooled = session["pooled"] == true
-		}
-		if session["session_id"] == joined && session["result_at_ms"] == nil {
-			t.Fatalf("the kept session's result time was not recorded: %v", session)
-		}
+	if len(sessions) != 1 {
+		t.Fatalf("the record holds %d sessions, want one: %v", len(sessions), sessions)
 	}
-	if !sawPooled {
-		t.Fatalf("the record does not say segment 0 used a pooled session: %v", sessions)
+	session := sessions[0].(map[string]any)
+	if session["pooled"] != true || session["reply_text"] != "answer to what's the weather like" {
+		t.Fatalf("the session's own row should be the pooled first turn: %v", session)
+	}
+	recorded := session["follow_ups"].([]any)
+	if len(recorded) != 1 {
+		t.Fatalf("follow_ups = %v", recorded)
+	}
+	followUp := recorded[0].(map[string]any)
+	if followUp["text"] != "in São Paulo" || followUp["result_at_ms"] == nil || followUp["reply_text"] != "answer to in São Paulo" || followUp["interrupted_reply"] != false {
+		t.Fatalf("the follow-up's turn was not recorded: %v", followUp)
 	}
 	if record["finalized_at_ms"] == nil {
 		t.Fatalf("finalized_at_ms not set after finish: %v", record)
 	}
-	// No session event of a superseded session may follow its decision.
-	supersededAt := map[string]int{}
-	for position, event := range events {
-		if event.name == eventDecision && event.data["role"] == RoleSuperseded {
-			supersededAt[event.data["session_id"].(string)] = position
-		}
-	}
-	for position, event := range events {
-		if event.name != eventSessionEvent {
-			continue
-		}
-		if at, ok := supersededAt[event.data["session_id"].(string)]; ok && position > at {
-			t.Fatalf("event %d passes on a session_event of %s after it was superseded at %d", position, event.data["session_id"], at)
-		}
-	}
 }
 
-func TestASeparateSegmentKeepsTheEarlierSessionAndStartsAnotherBesideIt(t *testing.T) {
+func TestALaterSegmentInterruptsAReplyStillRunningAndItsResultIsNeverPassedOn(t *testing.T) {
 	h := newHarness(t, nil)
-	utteranceID := h.createUtterance("weather-burger")
+	h.bridge.resultWait = 300 * time.Millisecond
+	utteranceID := h.createUtterance("weather-interrupted")
 	now := time.Now().UnixMilli()
-	h.postSegment(utteranceID, 0, "what's the weather like", now-2000)
-	h.postSegment(utteranceID, 1, "can you add cheese to my burger", now)
+	h.postSegment(utteranceID, 0, "what's the weather like", now-1000)
+	h.postSegment(utteranceID, 1, "in São Paulo", now)
 	h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal)
 	events := h.followUntilDone(utteranceID)
 
 	_, ids, sent, stopped := h.bridge.snapshot()
-	earlier := sessionByText(t, ids, sent, "what's the weather like")
-	joined := sessionByText(t, ids, sent, "what's the weather like can you add cheese to my burger")
-	burger := sessionByText(t, ids, sent, "can you add cheese to my burger")
-	roles := decisionsOf(events)
-	if roles[earlier] != RoleKept || roles[burger] != RoleSeparate || roles[joined] != RoleSuperseded {
-		t.Fatalf("decisions = %v; want earlier %s kept, burger %s separate, joined %s superseded", roles, earlier, burger, joined)
+	if len(ids) != 1 || len(sent[ids[0]]) != 2 || len(stopped) != 0 {
+		t.Fatalf("sessions %v sent %v stopped %v; want one session with two messages, still running", ids, sent, stopped)
 	}
-	if len(stopped) != 1 || stopped[0] != joined {
-		t.Fatalf("stopped = %v; want only the joined session %s", stopped, joined)
+	if interrupted := h.bridge.interruptedSessions(); len(interrupted) != 1 || interrupted[0] != ids[0] {
+		t.Fatalf("interrupted = %v; want the running turn of %s interrupted once", interrupted, ids[0])
 	}
-	results := 0
+	if results := countOf(sessionEventTypes(events), "result"); results != 1 {
+		t.Fatalf("%d results passed on, want only the second turn's: %v", results, sessionEventTypes(events))
+	}
+	followUps := eventsNamed(events, eventFollowUp)
+	if len(followUps) != 1 || followUps[0].data["interrupted_reply"] != true {
+		t.Fatalf("follow_up events = %v; want one that says it interrupted the reply", followUps)
+	}
+	_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+	session := record["sessions"].([]any)[0].(map[string]any)
+	if session["result_at_ms"] != nil {
+		t.Fatalf("the interrupted first turn has a result time: %v", session)
+	}
+	if followUp := session["follow_ups"].([]any)[0].(map[string]any); followUp["interrupted_reply"] != true || followUp["result_at_ms"] == nil {
+		t.Fatalf("follow-up = %v", followUp)
+	}
+}
+
+func TestAnInterruptedTurnThatEndsLateIsStillNeverPassedOn(t *testing.T) {
+	defer func(wait time.Duration) { interruptedTurnEndWait = wait }(interruptedTurnEndWait)
+	interruptedTurnEndWait = 20 * time.Millisecond
+	h := newHarness(t, nil)
+	h.bridge.resultWait = 300 * time.Millisecond
+	// The interrupted turn ends only after the next message has been sent
+	// and echoed: its block and result are known by their message id.
+	h.bridge.interruptEndDelay = 120 * time.Millisecond
+	utteranceID := h.createUtterance("weather-late-interrupt-end")
+	now := time.Now().UnixMilli()
+	h.postSegment(utteranceID, 0, "what's the weather like", now-1000)
+	waitFor(t, "the first turn's block", func() bool {
+		_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+		sessions, _ := record["sessions"].([]any)
+		return len(sessions) == 1 && sessions[0].(map[string]any)["first_block_at_ms"] != nil
+	})
+	h.postSegment(utteranceID, 1, "in São Paulo", now)
+	h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal)
+	events := h.followUntilDone(utteranceID)
+	var replies []string
 	for _, event := range events {
-		if event.name == eventSessionEvent {
-			if inner := event.data["event"].(map[string]any); inner["type"] == "result" {
-				results++
-			}
+		if event.name != eventSessionEvent {
+			continue
+		}
+		if inner := event.data["event"].(map[string]any); inner["type"] == "result" {
+			replies = append(replies, inner["result"].(map[string]any)["text"].(string))
 		}
 	}
-	if results < 2 {
-		t.Fatalf("want the results of both kept sessions passed on, got %d", results)
+	if len(replies) != 1 || replies[0] != "answer to in São Paulo" {
+		t.Fatalf("results passed on = %q; want only the reply to the second message", replies)
+	}
+}
+
+func TestWordsNotMeantForTheAssistantAreWithheldAndTheSessionArchivedWhenNobodySendsThem(t *testing.T) {
+	defer func(limit time.Duration) { confirmationLimit = limit }(confirmationLimit)
+	confirmationLimit = 200 * time.Millisecond
+	h := newHarness(t, nil)
+	h.bridge.resultWait = time.Hour
+	utteranceID := h.createUtterance("overheard")
+	now := time.Now().UnixMilli()
+	h.postSegment(utteranceID, 0, "yeah they went over it yesterday", now)
+	events := h.followUntilDone(utteranceID)
+
+	_, ids, sent, stopped := h.bridge.snapshot()
+	if len(ids) != 1 || len(sent[ids[0]]) != 1 {
+		t.Fatalf("sessions %v sent %v; want the one session the first words started", ids, sent)
+	}
+	withheld := eventsNamed(events, eventNotForAssistant)
+	if len(withheld) != 1 || withheld[0].data["text"] != "yeah they went over it yesterday" || withheld[0].data["reason"] != "talk with someone else" || withheld[0].data["model"] != "fake-model" {
+		t.Fatalf("not_for_assistant events = %v", withheld)
+	}
+	if len(eventsNamed(events, eventAwaitingConfirmation)) != 0 {
+		t.Fatal("withheld words went out as awaiting_confirmation, which a phone may send by a countdown")
+	}
+	if ended := eventsNamed(events, eventConfirmationEnded); len(ended) != 1 || ended[0].data["state"] != ConfirmationExpired {
+		t.Fatalf("confirmation_ended = %v, want expired", ended)
+	}
+	if interrupted := h.bridge.interruptedSessions(); len(interrupted) != 1 {
+		t.Fatalf("interrupted = %v; want the session's running turn interrupted", interrupted)
+	}
+	if !contains(stopped, ids[0]) || !contains(h.bridge.archivedSessions(), ids[0]) {
+		t.Fatalf("stopped %v archived %v; want %s stopped and archived once nobody sent the words", stopped, h.bridge.archivedSessions(), ids[0])
+	}
+	if roles := decisionsOf(events); roles[ids[0]] != RoleSuperseded {
+		t.Fatalf("decisions = %v; want the session superseded at the end", roles)
+	}
+	_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+	if record["confirmation_reason"] != ConfirmationReasonNotForAssistant || record["confirmation_state"] != ConfirmationExpired {
+		t.Fatalf("record confirmation = %v / %v", record["confirmation_reason"], record["confirmation_state"])
+	}
+	checks := record["addressee_checks"].([]any)
+	if len(checks) != 1 || checks[0].(map[string]any)["for_assistant"] != false {
+		t.Fatalf("addressee_checks = %v", checks)
+	}
+}
+
+func TestWithheldWordsThePersonSendsAnywayGoAgainIntoTheSameSession(t *testing.T) {
+	h := newHarness(t, nil)
+	h.bridge.resultWait = 150 * time.Millisecond
+	utteranceID := h.createUtterance("overheard-but-meant")
+	now := time.Now().UnixMilli()
+	h.postSegment(utteranceID, 0, "yeah they went over it yesterday", now)
+	h.followUntil(utteranceID, eventNotForAssistant)
+	// A segment that arrives after the words were withheld is not sent.
+	if status, answer := h.call("POST", "/api/voice/utterances/"+utteranceID+"/confirm", map[string]any{"text": "yeah they went over it yesterday"}, testPrincipal); status != 200 {
+		t.Fatalf("confirm = %d %v", status, answer)
+	}
+	events := h.followUntilDone(utteranceID)
+	_, ids, sent, stopped := h.bridge.snapshot()
+	if len(ids) != 1 || len(stopped) != 0 {
+		t.Fatalf("sessions %v stopped %v; want the one session, still running", ids, stopped)
+	}
+	if got := sent[ids[0]]; len(got) != 2 || got[1] != "yeah they went over it yesterday" {
+		t.Fatalf("the session was sent %v; want the words again after the person sent them anyway", got)
+	}
+	if results := countOf(sessionEventTypes(events), "result"); results != 1 {
+		t.Fatalf("%d results passed on, want the one reply to the words sent anyway: %v", results, sessionEventTypes(events))
+	}
+	if ended := eventsNamed(events, eventConfirmationEnded); len(ended) != 1 || ended[0].data["state"] != ConfirmationConfirmed {
+		t.Fatalf("confirmation_ended = %v, want confirmed", ended)
+	}
+	if asked := h.judge.askedTexts(); len(asked) != 1 {
+		t.Fatalf("the addressee check was asked %v; words the person sent anyway are not checked again", asked)
+	}
+}
+
+func TestAFailedAddresseeCheckIsReportedAndHoldsNothingBack(t *testing.T) {
+	h := newHarness(t, nil)
+	h.judge.failure = errors.New("every model of the role failed")
+	utteranceID := h.createUtterance("check-down")
+	now := time.Now().UnixMilli()
+	h.postSegment(utteranceID, 0, "what time is it", now)
+	// The check runs beside the session: wait for its failure to be
+	// recorded before the utterance ends.
+	waitFor(t, "the failed check's record", func() bool {
+		_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+		checks, _ := record["addressee_checks"].([]any)
+		return len(checks) == 1
+	})
+	h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal)
+	events := h.followUntilDone(utteranceID)
+	if results := countOf(sessionEventTypes(events), "result"); results != 1 {
+		t.Fatalf("%d results passed on, want the reply: a failed check holds nothing back", results)
+	}
+	problems := eventsNamed(events, eventError)
+	if len(problems) != 1 || !strings.Contains(problems[0].data["message"].(string), "did not run") {
+		t.Fatalf("error events = %v; want one saying the check did not run", problems)
+	}
+	_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+	check := record["addressee_checks"].([]any)[0].(map[string]any)
+	if check["for_assistant"] != nil || check["error"] != "every model of the role failed" {
+		t.Fatalf("addressee check = %v", check)
+	}
+}
+
+func TestSegmentsThePhoneCutsAreNotSentPastTheLimitOfOneQuickRecording(t *testing.T) {
+	h := newHarness(t, map[string]string{"VOICE_INTAKE_MAXIMUM_QUICK_SEGMENTS": "2"})
+	utteranceID := h.createUtterance("too-many-segments")
+	now := time.Now().UnixMilli()
+	for index, text := range []string{"one", "two", "three", "four"} {
+		h.postSegment(utteranceID, index, text, now)
+	}
+	h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal)
+	events := h.followUntilDone(utteranceID)
+	_, ids, sent, _ := h.bridge.snapshot()
+	if len(ids) != 1 || len(sent[ids[0]]) != 2 {
+		t.Fatalf("sessions %v sent %v; want one session with the first two segments", ids, sent)
+	}
+	if problems := eventsNamed(events, eventError); len(problems) != 1 || !strings.Contains(problems[0].data["message"].(string), "at most 2 segments") {
+		t.Fatalf("error events = %v; want the limit reported once", problems)
+	}
+}
+
+func TestTheTriggerDetailIsStoredAndAnOverlongOneRefused(t *testing.T) {
+	h := newHarness(t, nil)
+	body := map[string]any{"client_utterance_id": "with-detail", "mode": "quick", "strategy": "endpoint", "trigger": "assistant",
+		"trigger_detail": "show_flags=SHOW_SOURCE_ASSIST_GESTURE", "speech_started_at_ms": time.Now().UnixMilli()}
+	status, answer := h.call("POST", "/api/voice/utterances", body, testPrincipal)
+	if status != http.StatusCreated {
+		t.Fatalf("create = %d %v", status, answer)
+	}
+	_, record := h.call("GET", "/api/voice/utterances/"+answer["utterance_id"].(string), nil, testPrincipal)
+	if record["trigger_detail"] != "show_flags=SHOW_SOURCE_ASSIST_GESTURE" {
+		t.Fatalf("trigger_detail = %v", record["trigger_detail"])
+	}
+	body["client_utterance_id"], body["trigger_detail"] = "detail-too-long", strings.Repeat("x", maximumTriggerDetailCharacters+1)
+	if status, answer := h.call("POST", "/api/voice/utterances", body, testPrincipal); status != http.StatusBadRequest {
+		t.Fatalf("an overlong trigger_detail = %d %v, want 400", status, answer)
 	}
 }
 
@@ -653,25 +933,18 @@ func TestTheListWithDetailRecordCarriesSegmentsAndSessions(t *testing.T) {
 	}
 }
 
-func TestCancelStopsEverySessionTheUtteranceStarted(t *testing.T) {
+func TestCancelStopsTheSessionTheUtteranceStarted(t *testing.T) {
 	h := newHarness(t, nil)
 	h.bridge.resultWait = time.Hour
 	utteranceID := h.createUtterance("cancel-me")
 	now := time.Now().UnixMilli()
 	h.postSegment(utteranceID, 0, "what's the weather like", now-1000)
 	h.postSegment(utteranceID, 1, "in São Paulo", now)
-	// Wait for the three sessions of segment 1 to be decided.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
-		if decisions, _ := record["decisions"].([]any); len(decisions) >= 3 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("segment 1 was never decided: %v", record)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+	// Wait for segment 1 to reach the session.
+	waitFor(t, "segment 1 to be sent", func() bool {
+		_, ids, sent, _ := h.bridge.snapshot()
+		return len(ids) == 1 && len(sent[ids[0]]) == 2
+	})
 	if status, answer := h.call("POST", "/api/voice/utterances/"+utteranceID+"/cancel", nil, testPrincipal); status != 200 {
 		t.Fatalf("cancel = %d %v", status, answer)
 	}
@@ -688,8 +961,9 @@ func TestCancelStopsEverySessionTheUtteranceStarted(t *testing.T) {
 	}
 }
 
-func TestASegmentPastTheContinuationWindowIsSeparateWithoutAskingTheJudge(t *testing.T) {
+func TestASegmentPastTheContinuationWindowStillGoesIntoTheSameSession(t *testing.T) {
 	h := newHarness(t, map[string]string{"VOICE_INTAKE_CONTINUATION_WINDOW_MS": "2000"})
+	h.bridge.resultWait = 200 * time.Millisecond
 	utteranceID := h.createUtterance("late-segment")
 	now := time.Now().UnixMilli()
 	h.postSegment(utteranceID, 0, "what's the weather like", now-9000)
@@ -697,15 +971,11 @@ func TestASegmentPastTheContinuationWindowIsSeparateWithoutAskingTheJudge(t *tes
 	h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal)
 	events := h.followUntilDone(utteranceID)
 	_, ids, sent, stopped := h.bridge.snapshot()
-	if len(ids) != 2 || len(stopped) != 0 {
-		t.Fatalf("created %v and stopped %v; want two sessions and none stopped", ids, stopped)
+	if len(ids) != 1 || len(sent[ids[0]]) != 2 || len(stopped) != 0 {
+		t.Fatalf("sessions %v sent %v stopped %v; want one session with both segments", ids, sent, stopped)
 	}
-	roles := decisionsOf(events)
-	if roles[sessionByText(t, ids, sent, "what's the weather like")] != RoleKept || roles[sessionByText(t, ids, sent, "in São Paulo")] != RoleSeparate {
+	if roles := decisionsOf(events); roles[ids[0]] != RoleKept {
 		t.Fatalf("decisions = %v", roles)
-	}
-	if len(h.judge.asked) != 0 {
-		t.Fatalf("the judge was asked %v for a segment past the window", h.judge.asked)
 	}
 }
 
@@ -861,4 +1131,10 @@ func TestAPooledSessionTheReaperStoppedIsGivenUpForANewSession(t *testing.T) {
 	if !contains(stopped, stoppedByReaper) {
 		t.Fatalf("stopped = %v; want the stopped pooled session %s given up", stopped, stoppedByReaper)
 	}
+}
+
+func (b *fakeBridge) sharedInto(sessionID string) []string {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	return append([]string(nil), b.shared[sessionID]...)
 }

@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS utterances (
     audio_size_bytes             INTEGER NOT NULL DEFAULT 0,
     audio_received_at_ms         INTEGER,
     errors                       TEXT NOT NULL DEFAULT '[]',
+    -- What started the trigger, as the phone knows it: for the assistant
+    -- trigger, the flags Android gave. Empty when the phone sent none.
+    trigger_detail               TEXT NOT NULL DEFAULT '',
+    -- Why words are held: empty when the client asked for the hold,
+    -- not_for_assistant when the addressee check withheld them.
+    confirmation_reason          TEXT NOT NULL DEFAULT '',
     -- Streaming (contract v2): the phone streams PCM and this service ends
     -- the segments. Audio byte 0 is speech_started_at_ms.
     audio_streaming              INTEGER NOT NULL DEFAULT 0,
@@ -120,7 +126,9 @@ CREATE TABLE IF NOT EXISTS decisions (
 );
 CREATE INDEX IF NOT EXISTS decisions_by_utterance ON decisions(utterance_id);
 
--- One row per question put to the continuation judge.
+-- One row per question put to the continuation judge, which chose between
+-- sessions until one press became one session. Kept as history; nothing
+-- writes it now.
 CREATE TABLE IF NOT EXISTS continuation_judgments (
     sequence                     INTEGER PRIMARY KEY,
     utterance_id                 TEXT NOT NULL REFERENCES utterances(utterance_id),
@@ -223,3 +231,40 @@ CREATE TABLE IF NOT EXISTS app_releases (
     filename         TEXT NOT NULL,
     published_at_ms  INTEGER NOT NULL
 );
+
+-- A later message sent into an utterance's one session: a segment spoken
+-- after the first, or the words the person sent anyway after the addressee
+-- check withheld them. The session's own row keeps the first message and its
+-- timings; each later turn's are here.
+CREATE TABLE IF NOT EXISTS session_follow_ups (
+    sequence                     INTEGER PRIMARY KEY,
+    utterance_id                 TEXT NOT NULL REFERENCES utterances(utterance_id),
+    session_id                   TEXT NOT NULL,
+    segment_indexes              TEXT NOT NULL,
+    text                         TEXT NOT NULL,
+    -- 1 when the session's earlier turn had not finished and was interrupted.
+    interrupted_reply            INTEGER NOT NULL,
+    sent_at_ms                   INTEGER NOT NULL,
+    first_block_at_ms            INTEGER,
+    result_at_ms                 INTEGER,
+    reply_text                   TEXT NOT NULL DEFAULT '',
+    turn_cost_usd                REAL,
+    error                        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS session_follow_ups_by_utterance ON session_follow_ups(utterance_id);
+
+-- One row per question put to the addressee check: were the words so far
+-- meant for the assistant? for_assistant is NULL when the check failed.
+CREATE TABLE IF NOT EXISTS addressee_checks (
+    sequence                     INTEGER PRIMARY KEY,
+    utterance_id                 TEXT NOT NULL REFERENCES utterances(utterance_id),
+    text                         TEXT NOT NULL,
+    for_assistant                INTEGER,
+    reason                       TEXT NOT NULL DEFAULT '',
+    model                        TEXT NOT NULL DEFAULT '',
+    model_role                   TEXT NOT NULL,
+    started_at_ms                INTEGER NOT NULL,
+    duration_ms                  INTEGER NOT NULL,
+    error                        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS addressee_checks_by_utterance ON addressee_checks(utterance_id);

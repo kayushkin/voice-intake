@@ -94,6 +94,8 @@ var columnsAddedAfterTheFirstSchema = []struct{ table, column, definition string
 	{"segments", "dropped_reason", "TEXT NOT NULL DEFAULT ''"},
 	{"replay_configurations", "high_pass_cutoff_hz", "INTEGER NOT NULL DEFAULT 0"},
 	{"replay_configurations", "minimum_segment_mean_speech_probability", "REAL NOT NULL DEFAULT 0"},
+	{"utterances", "trigger_detail", "TEXT NOT NULL DEFAULT ''"},
+	{"utterances", "confirmation_reason", "TEXT NOT NULL DEFAULT ''"},
 }
 
 func addMissingColumns(db *sql.DB) error {
@@ -148,12 +150,14 @@ func (stored StoredSettings) Save(key, value string) error {
 
 // Utterance is one recording: one press of a trigger.
 type Utterance struct {
-	UtteranceID             string   `json:"utterance_id"`
-	ClientUtteranceID       string   `json:"client_utterance_id"`
-	PrincipalID             string   `json:"principal_id"`
-	Mode                    string   `json:"mode"`
-	Strategy                string   `json:"strategy"`
-	Trigger                 string   `json:"trigger"`
+	UtteranceID       string `json:"utterance_id"`
+	ClientUtteranceID string `json:"client_utterance_id"`
+	PrincipalID       string `json:"principal_id"`
+	Mode              string `json:"mode"`
+	Strategy          string `json:"strategy"`
+	Trigger           string `json:"trigger"`
+	// TriggerDetail is what started the trigger, as the phone knows it.
+	TriggerDetail           string   `json:"trigger_detail"`
 	SpeechStartedAtClientMs int64    `json:"speech_started_at_client_ms"`
 	SpeechStartedAtMs       int64    `json:"speech_started_at_ms"`
 	ClientClockSkewMs       int64    `json:"client_clock_skew_ms"`
@@ -188,7 +192,15 @@ type Utterance struct {
 	ConfirmationText         string `json:"confirmation_text"`
 	ConfirmationExpiresAtMs  *int64 `json:"confirmation_expires_at_ms"`
 	ConfirmationResolvedAtMs *int64 `json:"confirmation_resolved_at_ms"`
+	// ConfirmationReason says why the words are held: empty when the client
+	// asked for the hold, ConfirmationReasonNotForAssistant when the
+	// addressee check withheld them.
+	ConfirmationReason string `json:"confirmation_reason"`
 }
+
+// ConfirmationReasonNotForAssistant marks words the addressee check judged
+// were not meant for the assistant, held until the person sends them anyway.
+const ConfirmationReasonNotForAssistant = "not_for_assistant"
 
 // Confirmation states of an utterance whose words are held.
 const (
@@ -273,6 +285,40 @@ type UtteranceSession struct {
 	WorkingDirectory    string   `json:"working_directory"`
 	ReplyText           string   `json:"reply_text"`
 	TurnCostUSD         *float64 `json:"turn_cost_usd"`
+	// FollowUps are the later messages sent into the session, in order.
+	// The fields above describe the first message and its turn.
+	FollowUps []SessionFollowUp `json:"follow_ups"`
+}
+
+// SessionFollowUp is a later message sent into an utterance's one session,
+// and the turn that answered it.
+type SessionFollowUp struct {
+	Sequence       int64  `json:"-"`
+	SessionID      string `json:"-"`
+	SegmentIndexes []int  `json:"segment_indexes"`
+	Text           string `json:"text"`
+	// InterruptedReply is true when the session's earlier turn had not
+	// finished and was interrupted for this message.
+	InterruptedReply bool     `json:"interrupted_reply"`
+	SentAtMs         int64    `json:"sent_at_ms"`
+	FirstBlockAtMs   *int64   `json:"first_block_at_ms"`
+	ResultAtMs       *int64   `json:"result_at_ms"`
+	ReplyText        string   `json:"reply_text"`
+	TurnCostUSD      *float64 `json:"turn_cost_usd"`
+	Error            string   `json:"error"`
+}
+
+// AddresseeCheck is one question put to the addressee check: were the words
+// so far meant for the assistant? ForAssistant is nil when the check failed.
+type AddresseeCheck struct {
+	Text         string `json:"text"`
+	ForAssistant *bool  `json:"for_assistant"`
+	Reason       string `json:"reason"`
+	Model        string `json:"model"`
+	ModelRole    string `json:"model_role"`
+	StartedAtMs  int64  `json:"started_at_ms"`
+	DurationMs   int64  `json:"duration_ms"`
+	Error        string `json:"error"`
 }
 
 // Decision is one role a session was given, and why.
@@ -283,7 +329,9 @@ type Decision struct {
 	DecidedAtMs int64  `json:"decided_at_ms"`
 }
 
-// ContinuationJudgment is one question put to the continuation judge.
+// ContinuationJudgment is one question that was put to the continuation
+// judge, which chose between sessions until one press became one session.
+// The rows are history: nothing writes them now.
 type ContinuationJudgment struct {
 	SegmentIndex int    `json:"segment_index"`
 	EarlierText  string `json:"earlier_text"`
@@ -304,7 +352,8 @@ const utteranceColumns = `utterance_id, client_utterance_id, principal_id, mode,
 	audio_streaming, audio_format, stream_received_bytes, stop_recording_reason, stop_recording_sent_at_ms,
 	stopped_at_client_ms, stopped_at_ms, stop_reason, replay_id,
 	target_kind, target_session_id, target_signal_id,
-	confirm_before_send, confirmation_state, confirmation_text, confirmation_expires_at_ms, confirmation_resolved_at_ms`
+	confirm_before_send, confirmation_state, confirmation_text, confirmation_expires_at_ms, confirmation_resolved_at_ms,
+	trigger_detail, confirmation_reason`
 
 type rowScanner interface {
 	Scan(destination ...any) error
@@ -321,7 +370,8 @@ func scanUtterance(row rowScanner) (Utterance, error) {
 		&utterance.AudioStreaming, &utterance.AudioFormat, &utterance.StreamReceivedBytes, &utterance.StopRecordingReason, &utterance.StopRecordingSentAtMs,
 		&utterance.StoppedAtClientMs, &utterance.StoppedAtMs, &utterance.StopReason, &utterance.ReplayID,
 		&utterance.Target.Kind, &utterance.Target.SessionID, &utterance.Target.SignalID,
-		&utterance.ConfirmBeforeSend, &utterance.ConfirmationState, &utterance.ConfirmationText, &utterance.ConfirmationExpiresAtMs, &utterance.ConfirmationResolvedAtMs)
+		&utterance.ConfirmBeforeSend, &utterance.ConfirmationState, &utterance.ConfirmationText, &utterance.ConfirmationExpiresAtMs, &utterance.ConfirmationResolvedAtMs,
+		&utterance.TriggerDetail, &utterance.ConfirmationReason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Utterance{}, ErrNotFound
 	}
@@ -361,21 +411,22 @@ func (s *Store) CreateUtterance(utterance Utterance) (Utterance, bool, error) {
 	}
 	_, err = transaction.Exec(`INSERT INTO utterances (sequence, utterance_id, client_utterance_id, principal_id, mode, strategy, trigger,
 		speech_started_at_client_ms, speech_started_at_ms, client_clock_skew_ms, received_at_ms, audio_streaming, audio_format, replay_id,
-		target_kind, target_session_id, target_signal_id, confirm_before_send) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		target_kind, target_session_id, target_signal_id, confirm_before_send, trigger_detail) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		next, utterance.UtteranceID, utterance.ClientUtteranceID, utterance.PrincipalID, utterance.Mode, utterance.Strategy, utterance.Trigger,
 		utterance.SpeechStartedAtClientMs, utterance.SpeechStartedAtMs, utterance.ClientClockSkewMs, utterance.ReceivedAtMs,
 		utterance.AudioStreaming, utterance.AudioFormat, utterance.ReplayID,
-		utterance.Target.Kind, utterance.Target.SessionID, utterance.Target.SignalID, utterance.ConfirmBeforeSend)
+		utterance.Target.Kind, utterance.Target.SessionID, utterance.Target.SignalID, utterance.ConfirmBeforeSend, utterance.TriggerDetail)
 	if err != nil {
 		return Utterance{}, false, err
 	}
 	return utterance, true, transaction.Commit()
 }
 
-// HoldForConfirmation records the words held for the person to confirm.
-func (s *Store) HoldForConfirmation(utteranceID, text string, expiresAtMs int64) error {
-	return s.exec(`UPDATE utterances SET confirmation_state = ?, confirmation_text = ?, confirmation_expires_at_ms = ? WHERE utterance_id = ?`,
-		ConfirmationAwaiting, text, expiresAtMs, utteranceID)
+// HoldForConfirmation records the words held for the person to confirm, and
+// why: reason is empty for a hold the client asked for.
+func (s *Store) HoldForConfirmation(utteranceID, text string, expiresAtMs int64, reason string) error {
+	return s.exec(`UPDATE utterances SET confirmation_state = ?, confirmation_text = ?, confirmation_expires_at_ms = ?, confirmation_reason = ? WHERE utterance_id = ?`,
+		ConfirmationAwaiting, text, expiresAtMs, reason, utteranceID)
 }
 
 // ResolveConfirmation moves held words from awaiting to state, and reports
@@ -583,9 +634,105 @@ func (s *Store) UtteranceSessions(utteranceID string) ([]UtteranceSession, error
 		if err := json.Unmarshal([]byte(indexes), &session.SegmentIndexes); err != nil {
 			return nil, fmt.Errorf("session %s segment_indexes: %w", session.SessionID, err)
 		}
+		session.FollowUps = []SessionFollowUp{}
 		sessions = append(sessions, session)
 	}
-	return sessions, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	followUps, err := s.sessionFollowUps(utteranceID)
+	if err != nil {
+		return nil, err
+	}
+	for _, followUp := range followUps {
+		for index := range sessions {
+			if sessions[index].SessionID == followUp.SessionID {
+				sessions[index].FollowUps = append(sessions[index].FollowUps, followUp)
+			}
+		}
+	}
+	return sessions, nil
+}
+
+// InsertSessionFollowUp records a later message sent into a session and
+// answers the row's sequence, by which its turn's timings are set.
+func (s *Store) InsertSessionFollowUp(utteranceID string, followUp SessionFollowUp) (int64, error) {
+	indexes, err := json.Marshal(followUp.SegmentIndexes)
+	if err != nil {
+		return 0, err
+	}
+	result, err := s.db.Exec(`INSERT INTO session_follow_ups (utterance_id, session_id, segment_indexes, text, interrupted_reply, sent_at_ms) VALUES (?,?,?,?,?,?)`,
+		utteranceID, followUp.SessionID, string(indexes), followUp.Text, followUp.InterruptedReply, followUp.SentAtMs)
+	if err != nil {
+		return 0, fmt.Errorf("INSERT session_follow_ups: %w", err)
+	}
+	return result.LastInsertId()
+}
+
+// SetFollowUpFirstBlock records the first block event of a follow-up's turn, once.
+func (s *Store) SetFollowUpFirstBlock(sequence, atMs int64) error {
+	return s.exec(`UPDATE session_follow_ups SET first_block_at_ms = ? WHERE sequence = ? AND first_block_at_ms IS NULL`, atMs, sequence)
+}
+
+// SetFollowUpResult records the result event of a follow-up's turn, its
+// text and what the turn cost.
+func (s *Store) SetFollowUpResult(sequence, atMs int64, text string, costUSD *float64) error {
+	return s.exec(`UPDATE session_follow_ups SET result_at_ms = ?, reply_text = ?, turn_cost_usd = ? WHERE sequence = ? AND result_at_ms IS NULL`, atMs, text, costUSD, sequence)
+}
+
+// SetFollowUpError records that a follow-up could not be sent.
+func (s *Store) SetFollowUpError(sequence int64, message string) error {
+	return s.exec(`UPDATE session_follow_ups SET error = ? WHERE sequence = ?`, message, sequence)
+}
+
+func (s *Store) sessionFollowUps(utteranceID string) ([]SessionFollowUp, error) {
+	rows, err := s.db.Query(`SELECT sequence, session_id, segment_indexes, text, interrupted_reply, sent_at_ms, first_block_at_ms, result_at_ms, reply_text, turn_cost_usd, error
+		FROM session_follow_ups WHERE utterance_id = ? ORDER BY sequence`, utteranceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var followUps []SessionFollowUp
+	for rows.Next() {
+		var followUp SessionFollowUp
+		var indexes string
+		if err := rows.Scan(&followUp.Sequence, &followUp.SessionID, &indexes, &followUp.Text, &followUp.InterruptedReply, &followUp.SentAtMs,
+			&followUp.FirstBlockAtMs, &followUp.ResultAtMs, &followUp.ReplyText, &followUp.TurnCostUSD, &followUp.Error); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(indexes), &followUp.SegmentIndexes); err != nil {
+			return nil, fmt.Errorf("follow-up %d segment_indexes: %w", followUp.Sequence, err)
+		}
+		followUps = append(followUps, followUp)
+	}
+	return followUps, rows.Err()
+}
+
+// InsertAddresseeCheck records one question put to the addressee check.
+func (s *Store) InsertAddresseeCheck(utteranceID string, check AddresseeCheck) error {
+	return s.exec(`INSERT INTO addressee_checks (utterance_id, text, for_assistant, reason, model, model_role, started_at_ms, duration_ms, error)
+		VALUES (?,?,?,?,?,?,?,?,?)`,
+		utteranceID, check.Text, check.ForAssistant, check.Reason, check.Model, check.ModelRole, check.StartedAtMs, check.DurationMs, check.Error)
+}
+
+// AddresseeChecks returns an utterance's addressee checks in order.
+func (s *Store) AddresseeChecks(utteranceID string) ([]AddresseeCheck, error) {
+	rows, err := s.db.Query(`SELECT text, for_assistant, reason, model, model_role, started_at_ms, duration_ms, error
+		FROM addressee_checks WHERE utterance_id = ? ORDER BY sequence`, utteranceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	checks := []AddresseeCheck{}
+	for rows.Next() {
+		var check AddresseeCheck
+		if err := rows.Scan(&check.Text, &check.ForAssistant, &check.Reason, &check.Model, &check.ModelRole, &check.StartedAtMs, &check.DurationMs, &check.Error); err != nil {
+			return nil, err
+		}
+		checks = append(checks, check)
+	}
+	return checks, rows.Err()
 }
 
 // InsertDecision records a decision.
@@ -610,14 +757,6 @@ func (s *Store) Decisions(utteranceID string) ([]Decision, error) {
 		decisions = append(decisions, decision)
 	}
 	return decisions, rows.Err()
-}
-
-// InsertContinuationJudgment records one question put to the judge.
-func (s *Store) InsertContinuationJudgment(utteranceID string, judgment ContinuationJudgment) error {
-	return s.exec(`INSERT INTO continuation_judgments (utterance_id, segment_index, earlier_text, new_text, continues, reason, model, model_role, started_at_ms, duration_ms, error)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		utteranceID, judgment.SegmentIndex, judgment.EarlierText, judgment.NewText, judgment.Continues, judgment.Reason, judgment.Model,
-		judgment.ModelRole, judgment.StartedAtMs, judgment.DurationMs, judgment.Error)
 }
 
 // ContinuationJudgments returns an utterance's judgments in order.

@@ -30,19 +30,19 @@ time with it. Both values are stored.
 
 | Route | Does |
 |-------|------|
-| `POST /api/voice/utterances` | `{"client_utterance_id","mode","strategy","trigger","speech_started_at_ms"}` and optionally `"target"` (below) → 201 `{"utterance_id":"utterance_000001"}`; the same `client_utterance_id` again → 200, same row; a target session or signal that is missing or someone else's → 404, a signal that is a notification → 409 (one already closed is not found, 404), the bridge not answering → 502 |
+| `POST /api/voice/utterances` | `{"client_utterance_id","mode","strategy","trigger","speech_started_at_ms"}` and optionally `"target"` (below) and `"trigger_detail"` (what started the trigger, at most 500 characters) → 201 `{"utterance_id":"utterance_000001"}`; the same `client_utterance_id` again → 200, same row; a target session or signal that is missing or someone else's → 404, a signal that is a notification → 409 (one already closed is not found, 404), the bridge not answering → 502 |
 | `POST /api/voice/utterances/{id}/segments` | `{"index","text","speech_ended_at_ms"}` → 202 and dispatch; an index already received → 200, ignored; after cancel → 409 |
 | `POST /api/voice/utterances/{id}/segments/{index}/audio?speech_ended_at_ms=…` | body the segment's sound, `audio/wav`, 16 kHz mono 16-bit PCM; transcribed, then handled as a text segment with that index → 202 `{"text","transcription_ms","audio_duration_ms","status":"accepted"}`; no words → 200 `"status":"no words"`, stored, not dispatched; an index already received → 200, not transcribed; after cancel → 409; transcription failed → 502, nothing stored; no transcription service set → 503 (an addition: see *Contract changes*) |
 | `POST /api/voice/utterances/{id}/finish` | `{"ended_at_ms"}` → 200; decisions become final once every received segment is handled |
-| `POST /api/voice/utterances/{id}/cancel` | → 200; stops every session the utterance started, and discards words held for confirmation |
-| `POST /api/voice/utterances/{id}/confirm` | optional `{"text"}`, which must be the words held → 200 `{"utterance_id","status":"confirmed"}` and the words are sent; nothing held, or already confirmed, canceled or expired → 409; other words → 409 (an addition: see *Confirmation*) |
+| `POST /api/voice/utterances/{id}/cancel` | → 200; stops the session the utterance started, and discards words held for confirmation or withheld by the addressee check |
+| `POST /api/voice/utterances/{id}/confirm` | optional `{"text"}`, which must be the words held → 200 `{"utterance_id","status":"confirmed"}` and the words are sent; nothing held, or already confirmed, canceled or expired → 409; other words → 409 (an addition: see *Confirmation*). It also sends words the addressee check withheld (*The addressee check*) |
 | `POST /api/voice/utterances/{id}/audio?filename=…` | body the bytes, `audio/wav`, `audio/ogg` or `audio/flac` → 200 `{"shared_into":[…]}`; kept in the data directory and shared into every session the utterance still keeps, and into any it starts later |
-| `GET /api/voice/utterances/{id}` | the row: segments, sessions with roles and timings, decisions, continuation judgments |
-| `GET /api/voice/utterances?limit=50` | the caller's utterances, newest first; with `detail=record` each row is the whole record as `GET /api/voice/utterances/{id}` answers it (segments, sessions, decisions, judgments); any other `detail` → 400 |
+| `GET /api/voice/utterances/{id}` | the row: segments, the session with its role, timings and `follow_ups`, decisions, `addressee_checks`, and the continuation judgments of utterances made before one press became one session |
+| `GET /api/voice/utterances?limit=50` | the caller's utterances, newest first; with `detail=record` each row is the whole record as `GET /api/voice/utterances/{id}` answers it (segments, sessions, decisions, addressee checks); any other `detail` → 400 |
 | `GET /api/voice/utterances/{id}/events` | Server-Sent Events, below |
 | `GET /api/voice/settings`, `PATCH /api/voice/settings` | the settings below; an unknown field or a value of the wrong type is 400 and nothing is written |
 | `POST /api/voice/utterances/{id}/audio-stream?offset_bytes=N` | contract v2: body raw 16 kHz mono 16-bit PCM → 200 `{"received_bytes"}`; an offset below the total is a repeat, its overlap ignored; above it → 409 `{"expected_offset_bytes"}`; after stop → 409 |
-| `POST /api/voice/utterances/{id}/stop` | contract v2: `{"ended_at_ms","reason"}` → 200; reason is `user`, `reply_playing`, `max_duration`, `continuation_window_closed` or `no_speech` |
+| `POST /api/voice/utterances/{id}/stop` | contract v2: `{"ended_at_ms","reason"}` → 200; reason is `user`, `reply_playing`, `max_duration`, or a `stop_recording` reason sent back: `continuation_window_closed`, `no_speech`, `segment_limit` or `not_for_assistant` |
 | `GET /api/voice/latency?group_by=strategy\|pooled\|trigger\|source\|configuration` | median intervals per group, below |
 | `POST /api/voice/replay-recordings?expected_text=…&ground_truth_transcriber=…` | body a 16 kHz mono WAV → 201 the recording, with the true speech end from the transcriber's word times (or `true_speech_end_ms` with `true_speech_end_source`) |
 | `GET /api/voice/replay-recordings` | every recording kept for replay |
@@ -59,21 +59,23 @@ time with it. Both values are stored.
 ### Events
 
 `GET …/events` sends the utterance's whole history first and then live events,
-until every session the utterance keeps has finished its turn, or five
-minutes pass. A comment line every 15 seconds keeps proxies from closing a
+until the utterance is final and its session has finished its turn, or five
+minutes pass. `done` is never sent while a streamed recording still runs. A comment line every 15 seconds keeps proxies from closing a
 quiet stream; the answer carries `X-Accel-Buffering: no`.
 
 - `event: dispatch` `{"session_id","segment_indexes","text","role":"speculative"}`
-- `event: decision` `{"session_id","role":"kept|superseded|separate","reason"}`
-- `event: session_event` `{"session_id","event":<the llm-bridge-server event, unchanged>}`, for sessions not superseded. The reply is the `result` event's text.
+- `event: decision` `{"session_id","role":"kept|superseded","reason"}`. An utterance's one session is `kept` as soon as it is dispatched; `superseded` now only ends a session whose words were withheld and never sent. (`separate` was a role until one press became one session.)
+- `event: follow_up` `{"session_id","segment_indexes","text","interrupted_reply"}` when a later segment is sent into the session as its next message; `interrupted_reply` is true when the earlier turn was still running and was interrupted (an addition: see *Contract changes*)
+- `event: session_event` `{"session_id","event":<the llm-bridge-server event, unchanged>}`, for a session not superseded. The reply is the `result` event's text, and a session sent a follow-up has one `result` per turn. While the person is speaking these events are kept back (*How segments are dispatched*).
+- `event: not_for_assistant` `{"text","reason","model","expires_at_ms"}` when the addressee check withheld the words (*The addressee check*)
 - `event: error` `{"message"}`, when a session could not be started, sent to or stopped (an addition: see *Contract changes*)
 - `event: done` `{}`
 - `event: awaiting_confirmation` `{"text","expires_at_ms"}` when the words are held for the person to confirm, and `event: confirmation_ended` `{"state":"confirmed|cancelled|expired"}` when that ends (additions: see *Confirmation*)
-- Streaming utterances also get `event: hearing` `{"speech"}` when the detector starts or stops hearing speech, `event: transcript` `{"index","text"}` once a segment is transcribed, and `event: stop_recording` `{"reason":"continuation_window_closed|max_duration|no_speech"}`, sent once.
+- Streaming utterances also get `event: hearing` `{"speech"}` when the detector starts or stops hearing speech, `event: transcript` `{"index","text"}` once a segment is transcribed, and `event: stop_recording` `{"reason":"continuation_window_closed|max_duration|no_speech|segment_limit|not_for_assistant"}`, sent once.
 
 ## Streaming: the server ends the segments
 
-An utterance made with `"audio_streaming":true,"audio_format":"pcm_s16le_16000_mono"` sends its sound as it is recorded, and this service cuts it into segments. Byte 0 of the stream is `speech_started_at_ms`. Each chunk is scored by speech-server's Silero voice activity detector (`VOICE_INTAKE_SPEECH_DETECTION_URL`), 32 ms windows with the LSTM state kept across chunks; the endpointer in `speech_detection.go` hears speech from a window scoring 0.5, keeps hearing it down to 0.35, and ends a segment when silence has lasted `endpoint_silence_ms` (`eager_silence_ms` under the eager strategy). Speech shorter than 200 ms — a click, the phone's start tick — is dropped. Before the detector hears a chunk it passes a second-order high-pass filter at `high_pass_cutoff_hz` (0: none), which cuts the rumble of wind and of the phone being handled; the segment is cut from the filtered audio, and the recording shared into sessions is the audio as sent. A posted segment's audio passes the same filter before it is transcribed. A segment whose mean speech probability, over its windows from the first heard as speech to the last, is below `minimum_segment_mean_speech_probability` (0: none) is noise the detector half-heard: it is stored with no words, `mean_speech_probability`, `voiced_ms` and a `dropped_reason`, is not transcribed, and holds its index like any segment with no words; its `transcript` event carries `dropped_reason`. Every streamed segment records its `mean_speech_probability` and `voiced_ms`. A segment is cut with 200 ms either side, transcribed by the `transcriber` setting's service, stored with source `stream`, and dispatched like any other. Long mode and the manual strategy end no segment on a pause: the speech is one segment, cut at `stop`. `stop_recording` is sent when `maximum_recording_ms` of audio has arrived, when `no_speech_timeout_ms` has passed with no speech, or (quick mode) when `continuation_window_ms` has passed since the last segment's speech ended. At `stop` an open segment ends at the end of the audio received; once every segment is transcribed the recording is shared into the kept sessions as `utterance_NNNNNN.wav` and the decisions become final. A failed transcription in a stream stores the segment with no words, so later segments are not held up.
+An utterance made with `"audio_streaming":true,"audio_format":"pcm_s16le_16000_mono"` sends its sound as it is recorded, and this service cuts it into segments. Byte 0 of the stream is `speech_started_at_ms`. Each chunk is scored by speech-server's Silero voice activity detector (`VOICE_INTAKE_SPEECH_DETECTION_URL`), 32 ms windows with the LSTM state kept across chunks; the endpointer in `speech_detection.go` hears speech from a window scoring 0.5, keeps hearing it down to 0.35, and ends a segment when silence has lasted `endpoint_silence_ms` (`eager_silence_ms` under the eager strategy). Speech shorter than 200 ms — a click, the phone's start tick — is dropped. Before the detector hears a chunk it passes a second-order high-pass filter at `high_pass_cutoff_hz` (0: none), which cuts the rumble of wind and of the phone being handled; the segment is cut from the filtered audio, and the recording shared into sessions is the audio as sent. A posted segment's audio passes the same filter before it is transcribed. A segment whose mean speech probability, over its windows from the first heard as speech to the last, is below `minimum_segment_mean_speech_probability` (0: none) is noise the detector half-heard: it is stored with no words, `mean_speech_probability`, `voiced_ms` and a `dropped_reason`, is not transcribed, and holds its index like any segment with no words; its `transcript` event carries `dropped_reason`. Every streamed segment records its `mean_speech_probability` and `voiced_ms`. A segment is cut with 200 ms either side, transcribed by the `transcriber` setting's service, stored with source `stream`, and dispatched like any other. Long mode and the manual strategy end no segment on a pause: the speech is one segment, cut at `stop`. `stop_recording` is sent when `maximum_recording_ms` of audio has arrived, when `no_speech_timeout_ms` has passed with no speech, (quick mode) when `continuation_window_ms` has passed since the last segment's speech ended, (quick mode) when the recording has cut `maximum_quick_segments` segments (`segment_limit`), or when the addressee check judged the words were not meant for the assistant (`not_for_assistant`). A segment too weakly heard to transcribe counts as no speech for all of these: noise at every pause neither keeps the window open, nor stops `no_speech`, nor counts toward the limit. **A streamed recording ends only by its stop**: the continuation window is the stream's own, in audio time, and nothing becomes final, and `done` is not sent, while the microphone is open. (Until 2026-11-25 the dispatcher ran a window of its own in real time; on `utterance_000375` it sent `done` first, the `stop_recording` that followed was dropped, and the phone recorded for three minutes.) A phone that does not post `stop` within 10 seconds of `stop_recording`, or that sends no audio for 20 seconds, has its stream ended from this side, with `stop_reason` `stop_recording_unanswered` or `audio_stopped_arriving` and an `error` event; audio after that is 409. At `stop` an open segment ends at the end of the audio received; once every segment is transcribed the recording is shared into the session as `utterance_NNNNNN.wav` and the utterance becomes final. A failed transcription in a stream stores the segment with no words, so later segments are not held up.
 
 ## Replays
 
@@ -81,32 +83,60 @@ A replay runs a stored recording through the streaming path at the pace it was s
 
 ## How segments are dispatched
 
-A segment posted as audio is transcribed first (below) and from then on is
-the same as one posted as text. A segment whose transcript has no words
-holds its index, so later segments do not wait for it, and is otherwise
-skipped: it starts no session, and the continuation window runs from the
-last segment that had words.
+**One press, one session.** A segment posted as audio is transcribed first
+(below) and from then on is the same as one posted as text. A segment whose
+transcript has no words holds its index, so later segments do not wait for
+it, and is otherwise skipped.
 
-- **Segment 0** goes at once to a waiting pooled session when one is ready and its text runs at the default effort; otherwise to a new session. Its role is `speculative`.
-- **Segment k within the continuation window** — received no later than `continuation_window_ms` after segment k−1's speech end — starts three things at the same moment: a session for the latest request's segments joined with segment k, a session for segment k alone, and a question to the continuation judge. When the judge says *continues*, the joined session is kept and the earlier one and the lone one are superseded. When it says *separate*, the earlier session is kept, the lone one is `separate`, and the joined one is superseded. A superseded session is stopped at once and moved to the chat's Archive.
-- **"The latest request"** is the last request the utterance holds, so after a separate request a further continuation joins onto that one, not onto segment 0. For an utterance whose segments all continue each other, this is segments 0..k.
-- **Segment k past the window** is a separate request without asking the judge, and the earlier session is kept.
-- **Final decisions**: after `finish`, or when the window passes with no new segment, every session still speculative is kept and nothing more is superseded.
-- **Segments are handled one at a time per utterance, in index order.** A segment that arrives while the previous one is still being judged waits for that decision, so a request is never joined onto a session that is about to be superseded. A segment that arrives out of order waits for the missing index.
-- **When the judge fails**, the joined session is kept, since its text holds every word, and the failure is in the decision's reason and the judgment row. When only one of the two new sessions could be started, that one decides.
-- **Effort** is `default_effort` unless the text contains one of `effort_raising_phrases` (any case) or the utterance is in long mode, and then `raised_effort`, on `raised_instance_id` and `raised_model` when they are set. A raised text never goes to a pooled session, which runs at the default.
+- **The first segment with words** goes at once to a waiting pooled session when one is ready and its text runs at the default effort; otherwise to a new session. `dispatch` is sent with role `speculative` and, at once, `decision` with role `kept`. No other session is started for the utterance.
+- **Every later segment with words** is sent into that session as its next message, and `follow_up` says so. The session holds every earlier word and its own reply, so it is the one to judge whether the new words continue the request, change it or ask something new; nothing here decides that. When the earlier turn is still running it is interrupted first (llm-bridge-server `POST /sessions/{id}/interrupt`), `interrupted_reply` is true, and none of that turn's later events are passed on. The bridge ends an interrupted turn with an empty `result` of its own some 50 to 80 ms later, so the new message is sent only after that result has come (or 2 seconds have passed), events are dropped until the new message's own echo shows on the session's stream, and a block or result that carries a message id of the interrupted turn is dropped however late it comes. The bridge's `turn_id` is no help here: it stamps the old turn's last events with the new turn's id.
+- **Replies wait while the person speaks.** For a streamed recording, session events are kept back from the moment the detector hears speech until that speech's segment has been handled. If it had words, a turn still running is interrupted and its kept-back draft is dropped, so the phone never speaks an answer to half a request; a turn that had finished has its kept-back reply passed on first, since the session answers the new words as one who has said it. If the speech had no words, the kept-back events go out.
+- **The limit.** A quick recording sends at most `maximum_quick_segments` segments (5). A streamed one is told to stop when the last of them ends; segments the phone cuts itself are not sent past it, and an `error` event says so once. Zero is no limit.
+- **Final.** The utterance becomes final after `finish` (for a streamed one, after `stop`, once every segment is transcribed), or, for segments the phone cuts itself, when `continuation_window_ms` passes with no new segment. `done` follows once the session has finished its turn.
+- **Segments are handled one at a time per utterance, in index order.** A segment that arrives out of order waits for the missing index.
+- **Effort** is `default_effort` unless the first segment's text contains one of `effort_raising_phrases` (any case) or the utterance is in long mode, and then `raised_effort`, on `raised_instance_id` and `raised_model` when they are set. A raised text never goes to a pooled session, which runs at the default.
+- **The record.** The session's row holds its first message and that turn's timings and reply; each later message is one of its `follow_ups`, with `segment_indexes`, `text`, `interrupted_reply`, `sent_at_ms`, `first_block_at_ms`, `result_at_ms`, `reply_text`, `turn_cost_usd` and `error`. The latency table measures first turns.
+
+Until 2026-11-25 a later segment started two more sessions (the request
+joined with it, and it alone) and a judge model chose which to keep. On
+`utterance_000381` an accidental start beside a conversation made 19 voice
+sessions and about 47 helper calls from one press, and the judge failed
+every time. The `continuation_judgments` of utterances from before are kept.
+
+## The addressee check
+
+An accidental start records whoever is talking. So beside the session,
+never ahead of it, a model reads the words heard so far and says whether
+they were meant for the assistant (`addressee_check.go`, llm-bridge-server
+`POST /oneshot` on `addressee_check_model_role`). One check runs at a time;
+words that arrive while it runs make it run again on all of them. Typed
+words (`trigger` `keyboard`), replays, and utterances whose words are held
+for confirmation or go to the person's own session or question are not
+checked. Each check is a row of the utterance's `addressee_checks`: `text`,
+`for_assistant` (null when it failed), `reason`, `model`, `model_role`,
+`started_at_ms`, `duration_ms`, `error`.
+
+- **For the assistant:** nothing changes.
+- **Not for the assistant:** the session's turn is interrupted and its events are no longer passed on; a streamed recording gets `stop_recording` with reason `not_for_assistant`; and once every word is in, the words are held and `event: not_for_assistant` `{"text","reason","model","expires_at_ms"}` is sent, `text` being every word heard and `reason` the model's few words. They then wait as held words do (*Confirmation*), with `confirmation_reason` `not_for_assistant` on the utterance: `POST …/confirm` sends them again, whole, into the same session; `POST …/cancel` discards them and stops and archives the session; after two minutes they expire, and the session is stopped, archived and marked `superseded`. **A client must never send these by a countdown**: that is why they are not sent as `awaiting_confirmation`.
+- **The check fails:** an `error` event says it did not run and that the words were sent unchecked. Nothing is held.
+
+The check takes a few seconds on this kind of model call, about as long as
+the session takes to say its first words, which is why it runs beside the
+session: ahead of it, every answer would wait for it. The cost is that an
+accidental start still gives one session a few seconds to act before it is
+interrupted.
 
 ## Targets: where the words go
 
 `target` on `POST /api/voice/utterances` says where the words go. Leaving it
 out is the same as `{"kind":"pool"}`.
 
-- `{"kind":"pool"}`: as above. A pooled voice session, or a fresh one like it, and later segments split and judged.
-- `{"kind":"new_session"}`: an ordinary chat session, started as the chat's New button starts one: on the instance the chat would pick from llm-bridge-server's `bridge-prefs` (the recorded last instance if it is enabled, else an enabled instance of the recorded last harness, preferring one with a last session), with type `interactive`, purpose `chat` and origin `voice-intake`, and with no model, effort, spend ceiling or tools sent, so the bridge pins the chat's harness defaults. Not a pooled session, and not the voice working directory or its short prompt. Segments are dispatched and judged as for the pool, each new session being a chat session; the effort-raising phrases and the raised settings do not apply.
+- `{"kind":"pool"}`: as above. A pooled voice session, or a fresh one like it, with later segments sent into it.
+- `{"kind":"new_session"}`: an ordinary chat session, started as the chat's New button starts one: on the instance the chat would pick from llm-bridge-server's `bridge-prefs` (the recorded last instance if it is enabled, else an enabled instance of the recorded last harness, preferring one with a last session), with type `interactive`, purpose `chat` and origin `voice-intake`, and with no model, effort, spend ceiling or tools sent, so the bridge pins the chat's harness defaults. Not a pooled session, and not the voice working directory or its short prompt. Segments are dispatched as for the pool, the one session being a chat session; the effort-raising phrases and the raised settings do not apply.
 - `{"kind":"session","session_id":"br_…"}`: the words go as the next message of a session the person already has. The bridge is asked, as the person, at create (404 if the session is missing or not theirs) and again by the send itself.
 - `{"kind":"signal","signal_id":"sig_…"}`: the words answer an open question through llm-bridge-server's `POST /signals/{id}/answer`. The bridge resolves the questions of one call or turn only all at once, so every open question that shares the signal's session and request id gets the same words. A notification is 409 at create, and a question already answered or dismissed is 404, since only open signals are read.
 
-For `session` and `signal` nothing is split or judged: the segments are kept, in order, and sent joined as **one message when the utterance finishes** (once confirmed, when the client asked for that: *Confirmation*) (after `finish`, or once a streamed utterance's `stop` has every segment transcribed). Streaming still ends segments at pauses, so `stop_recording` still comes when the continuation window closes. The reply streams on `/events` as `session_event`, with one `dispatch` and one `decision` (`kept`) for the person's session. When the bridge is first asked for an existing session's events it sends that session's last turn again; those events, and the user message itself, are not passed on, so the first `result` the phone sees is the reply to these words (when the answer goes to a tool call still parked in a running turn, that turn's events are passed on at once). The person's session is never stopped or archived from here, not even by `cancel`, and the recording is not shared into it. A message sent while the session is still mid-turn may be followed first by that turn's own result.
+For `session` and `signal` nothing is sent segment by segment: the segments are kept, in order, and sent joined as **one message when the utterance finishes** (once confirmed, when the client asked for that: *Confirmation*) (after `finish`, or once a streamed utterance's `stop` has every segment transcribed). Streaming still ends segments at pauses, so `stop_recording` still comes when the continuation window closes. The reply streams on `/events` as `session_event`, with one `dispatch` and one `decision` (`kept`) for the person's session. When the bridge is first asked for an existing session's events it sends that session's last turn again; those events, and the user message itself, are not passed on, so the first `result` the phone sees is the reply to these words (when the answer goes to a tool call still parked in a running turn, that turn's events are passed on at once). The person's session is never stopped or archived from here, not even by `cancel`, and the recording is not shared into it. A message sent while the session is still mid-turn may be followed first by that turn's own result.
 
 ## Confirmation: nothing goes to a session or a question unchecked
 
@@ -117,8 +147,7 @@ with no confirm screen is never left with words that expire unsent. Held: at fin
 transcribed) the segments are joined, stored as `confirmation_text`, and sent
 to the phone as `event: awaiting_confirmation` `{"text","expires_at_ms"}`.
 Nothing is sent until `POST …/confirm`; then they go as described above, and
-`new_session` starts one chat session for the joined words (nothing split or
-judged). `POST …/cancel` discards them. Held words nobody confirms expire
+`new_session` starts one chat session for the joined words. `POST …/cancel` discards them. Held words nobody confirms expire
 after two minutes, recorded as `expired` and never sent. Each ending sends
 `event: confirmation_ended` `{"state"}`, and the decisions become final then,
 so `done` comes after it. Without the hold the words go at
@@ -165,7 +194,7 @@ speech start, received, finished, finalized, canceled. Per segment: speech
 end, received, and for audio segments transcription started and ended
 (`transcription_ms` is the difference). Per session: dispatch started, dispatched (the send returned),
 first `block` event, `result` event, stopped. `GET /api/voice/latency?group_by=strategy|pooled|trigger|source` groups
-every dispatched session and reports, per group, the median of
+every dispatched session's first turn and reports, per group, the median of
 `speech_end_to_received`, `transcription`, `speech_end_to_transcribed`, `received_to_dispatched`, `speech_end_to_dispatched`,
 `dispatched_to_first_block`, `dispatched_to_result`, `speech_end_to_first_block`
 and `speech_end_to_result`, each measured from the speech end of the last
@@ -180,7 +209,8 @@ segment the session's text holds, with the number of samples behind each.
 | `default_effort` | low | `VOICE_INTAKE_DEFAULT_EFFORT` |
 | `default_model` | empty: the harness default | `VOICE_INTAKE_DEFAULT_MODEL` |
 | `effort_raising_phrases` | think hard, think carefully, take your time | `VOICE_INTAKE_EFFORT_RAISING_PHRASES` |
-| `continuation_judge_model_role` | efficient | `VOICE_INTAKE_CONTINUATION_JUDGE_MODEL_ROLE` |
+| `addressee_check_model_role` | efficient | `VOICE_INTAKE_ADDRESSEE_CHECK_MODEL_ROLE` |
+| `maximum_quick_segments` | 5 | `VOICE_INTAKE_MAXIMUM_QUICK_SEGMENTS` |
 | `instance_id` | empty | `VOICE_INTAKE_INSTANCE_ID` |
 | `endpoint_silence_ms` | 900 | `VOICE_INTAKE_ENDPOINT_SILENCE_MS` |
 | `eager_silence_ms` | 350 | `VOICE_INTAKE_EAGER_SILENCE_MS` |
@@ -194,7 +224,7 @@ segment the session's text holds, with the number of samples behind each.
 
 These are stored in the database: the environment seeds each once, and
 after that `PATCH /api/voice/settings` changes them. A new
-`continuation_judge_model_role` is checked against model-store's roles, a new
+`addressee_check_model_role` is checked against model-store's roles, a new
 `default_model` against its models, and a new `instance_id` against
 llm-bridge-server's instances; when the owner cannot be asked the answer is
 502; a new `transcriber` must be a name in `VOICE_INTAKE_TRANSCRIBERS`, and `raised_model` and `raised_instance_id` are checked like `default_model` and `instance_id`. The phone reads `endpoint_silence_ms` and `eager_silence_ms` when it cuts segments itself; for a streaming utterance this service uses them.
@@ -290,3 +320,12 @@ which a client that ignores unknown fields and events has to handle:
 - `trigger` takes `keyboard` as well: a question the person typed instead of spoke. The phone creates the utterance (strategy `manual`, no streaming), posts the text as segment 0 and finishes it, so the reply streams on `/events` exactly as a spoken one does, and `GET /api/voice/latency?group_by=trigger` shows typed questions as their own group.
 - `GET /api/voice/utterances` takes `detail=record`, which answers each row as the single-utterance route does, with its segments and sessions and their timings, so the phone's status page reads the last twenty in one call. Left out, the rows are as before.
 - `GET /api/voice/utterances/{id}` and the list carry more fields than the contract names: the phone's own timestamps beside the server-time ones, the clock skew, audio details, errors and the continuation judgments.
+- **One press, one session** (2026-11-25; *How segments are dispatched* and *The addressee check*, above). An utterance to the pool or a new chat session starts one session and sends every later segment into it. What a client sees that it did not before:
+  - `decision` comes at once with role `kept`; no session is `separate` any more, and `superseded` only ends a session whose words were withheld and never sent.
+  - `event: follow_up` `{"session_id","segment_indexes","text","interrupted_reply"}` for each later segment, and so more than one `result` per session: a client must release each turn's result, not the first per session.
+  - `event: not_for_assistant` `{"text","reason","model","expires_at_ms"}`, answered by the existing `confirm` and `cancel` routes and ended by `confirmation_ended`. On each utterance `confirmation_reason` (empty, or `not_for_assistant`) and `addressee_checks`.
+  - `stop_recording` and `POST …/stop` take two more reasons, `segment_limit` and `not_for_assistant`. An utterance's `stop_reason` may also be `stop_recording_unanswered` or `audio_stopped_arriving`, which only this service writes.
+  - `POST /api/voice/utterances` takes an optional `trigger_detail`, returned on each utterance.
+  - Each session carries `follow_ups`.
+  - `GET /api/voice/settings` carries `addressee_check_model_role` and `maximum_quick_segments`, and no longer `continuation_judge_model_role`, which no client read. The stored row of that name is left in the database, unused.
+  - `done` is never sent while a streamed recording runs, so `stop_recording` always reaches a connected client first.

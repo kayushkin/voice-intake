@@ -19,11 +19,17 @@ import (
 )
 
 // The contract's enumerations. Each is the whole list the phone may send.
+// TriggerKeyboard is the trigger of words the person typed instead of spoke.
+const TriggerKeyboard = "keyboard"
+
+// maximumTriggerDetailCharacters is the longest trigger_detail kept.
+const maximumTriggerDetailCharacters = 500
+
 var (
 	utteranceModes      = map[string]bool{"quick": true, "long": true}
 	utteranceStrategies = map[string]bool{"endpoint": true, "eager": true, "manual": true}
 	utteranceTriggers   = map[string]bool{"tile": true, "widget": true, "side_key": true, "assistant": true, "accessibility": true,
-		"shortcut": true, "app": true, "notification": true, "keyboard": true}
+		"shortcut": true, "app": true, "notification": true, TriggerKeyboard: true}
 	audioContentTypes = map[string]bool{"audio/wav": true, "audio/ogg": true, "audio/flac": true}
 )
 
@@ -176,6 +182,9 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 		Mode              string `json:"mode"`
 		Strategy          string `json:"strategy"`
 		Trigger           string `json:"trigger"`
+		// TriggerDetail is optional: what started the trigger, as the phone
+		// knows it.
+		TriggerDetail     string `json:"trigger_detail"`
 		SpeechStartedAtMs *int64 `json:"speech_started_at_ms"`
 		AudioStreaming    bool   `json:"audio_streaming"`
 		AudioFormat       string `json:"audio_format"`
@@ -203,6 +212,9 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 	}
 	if !utteranceTriggers[body.Trigger] {
 		problems = append(problems, fmt.Sprintf("trigger %q is not one of %s", body.Trigger, sortedKeys(utteranceTriggers)))
+	}
+	if length := len([]rune(body.TriggerDetail)); length > maximumTriggerDetailCharacters {
+		problems = append(problems, fmt.Sprintf("trigger_detail is %d characters; at most %d are kept", length, maximumTriggerDetailCharacters))
 	}
 	if body.SpeechStartedAtMs == nil {
 		problems = append(problems, "speech_started_at_ms is required")
@@ -248,6 +260,7 @@ func (s *Server) createUtterance(w http.ResponseWriter, r *http.Request) {
 	}
 	utterance, created, err := s.store.CreateUtterance(Utterance{
 		ClientUtteranceID: body.ClientUtteranceID, PrincipalID: principalOf(r), Mode: body.Mode, Strategy: body.Strategy, Trigger: body.Trigger,
+		TriggerDetail:           body.TriggerDetail,
 		SpeechStartedAtClientMs: *body.SpeechStartedAtMs, SpeechStartedAtMs: *body.SpeechStartedAtMs + skew, ClientClockSkewMs: skew, ReceivedAtMs: receivedAtMs,
 		AudioStreaming: body.AudioStreaming, AudioFormat: body.AudioFormat, Target: target, ConfirmBeforeSend: confirmBeforeSend,
 	})
@@ -340,8 +353,8 @@ func (s *Server) listUtterances(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, records)
 }
 
-// utteranceRecord gathers an utterance's segments, sessions, decisions and
-// judgments: GET /api/voice/utterances/{id}, and each row of the list with
+// utteranceRecord gathers an utterance's segments, sessions, decisions,
+// judgments and addressee checks: GET /api/voice/utterances/{id}, and each row of the list with
 // detail=record.
 func (s *Server) utteranceRecord(utterance Utterance) (UtteranceRecord, error) {
 	record := UtteranceRecord{Utterance: utterance}
@@ -355,7 +368,10 @@ func (s *Server) utteranceRecord(utterance Utterance) (UtteranceRecord, error) {
 	if record.Decisions, err = s.store.Decisions(utterance.UtteranceID); err != nil {
 		return record, err
 	}
-	record.ContinuationJudgments, err = s.store.ContinuationJudgments(utterance.UtteranceID)
+	if record.ContinuationJudgments, err = s.store.ContinuationJudgments(utterance.UtteranceID); err != nil {
+		return record, err
+	}
+	record.AddresseeChecks, err = s.store.AddresseeChecks(utterance.UtteranceID)
 	return record, err
 }
 
@@ -366,6 +382,7 @@ type UtteranceRecord struct {
 	Sessions              []UtteranceSession     `json:"sessions"`
 	Decisions             []Decision             `json:"decisions"`
 	ContinuationJudgments []ContinuationJudgment `json:"continuation_judgments"`
+	AddresseeChecks       []AddresseeCheck       `json:"addressee_checks"`
 }
 
 func (s *Server) getUtterance(w http.ResponseWriter, r *http.Request) {

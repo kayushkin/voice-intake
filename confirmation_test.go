@@ -123,8 +123,8 @@ func TestAHeldNewSessionStartsOneChatSessionOnlyWhenConfirmed(t *testing.T) {
 	}
 	events := h.followUntilDone(utteranceID)
 	_, ids, sent, _ := h.bridge.snapshot()
-	if len(ids) != 1 || len(sent[ids[0]]) != 1 || sent[ids[0]][0] != "plan my week and book the dentist" || len(h.judge.asked) != 0 {
-		t.Fatalf("sessions %v sent %v judge %v", ids, sent, h.judge.asked)
+	if len(ids) != 1 || len(sent[ids[0]]) != 1 || sent[ids[0]][0] != "plan my week and book the dentist" || len(h.judge.askedTexts()) != 0 {
+		t.Fatalf("sessions %v sent %v, and the addressee check was asked %v about words the person confirmed", ids, sent, h.judge.askedTexts())
 	}
 	if roles := decisionsOf(events); roles[ids[0]] != RoleKept {
 		t.Fatalf("decisions = %v", roles)

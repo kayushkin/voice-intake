@@ -1,6 +1,7 @@
 package voiceintake
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -37,7 +38,11 @@ func (d *fakeDetector) Score(ctx context.Context, streamID string, pcm []byte) (
 	for len(buffer) >= 1024 {
 		sample := int16(binary.LittleEndian.Uint16(buffer[0:2]))
 		probability := 0.05
-		if sample > 1000 || sample < -1000 {
+		switch {
+		case sample >= strongSpeechSample:
+			// Speech the detector is sure of.
+			probability = 0.99
+		case sample > 1000 || sample < -1000:
 			probability = 0.9
 		}
 		scores.Probabilities = append(scores.Probabilities, probability)
@@ -55,14 +60,31 @@ func (d *fakeDetector) Close(ctx context.Context, streamID string) error {
 	return nil
 }
 
-// queueTranscriber answers each call with the next text in its queue.
+// strongSpeechSample is the sample value fakeDetector scores 0.99; the 8000
+// of pcmOf's speech scores 0.9, which a test can set the weak-speech
+// minimum above.
+const strongSpeechSample = 24000
+
+// strongSpeechPCM is milliseconds of speech the fake detector is sure of.
+func strongSpeechPCM(milliseconds int) []byte {
+	var pcm []byte
+	for range milliseconds * 16 {
+		pcm = binary.LittleEndian.AppendUint16(pcm, uint16(strongSpeechSample))
+	}
+	return pcm
+}
+
+// queueTranscriber answers each call with the next text in its queue, after
+// delay.
 type queueTranscriber struct {
 	mutex sync.Mutex
 	texts []string
 	calls int
+	delay time.Duration
 }
 
 func (q *queueTranscriber) Transcribe(ctx context.Context, wav []byte) (Transcript, error) {
+	time.Sleep(q.delay)
 	q.mutex.Lock()
 	defer q.mutex.Unlock()
 	q.calls++
@@ -208,9 +230,11 @@ func TestTwoPausesMakeTwoSegmentsAndAShortClickMakesNone(t *testing.T) {
 	}
 	roles := decisionsOf(events)
 	_, ids, sent, _ := h.bridge.snapshot()
-	joined := sessionByText(t, ids, sent, "what's the weather like in São Paulo")
-	if roles[joined] != RoleKept {
-		t.Fatalf("joined session role = %q (roles %v)", roles[joined], roles)
+	if len(ids) != 1 || len(sent[ids[0]]) != 2 || sent[ids[0]][0] != "what's the weather like" || sent[ids[0]][1] != "in São Paulo" {
+		t.Fatalf("sessions %v sent %v; want one session with the two segments as two messages", ids, sent)
+	}
+	if roles[ids[0]] != RoleKept {
+		t.Fatalf("the session's role = %q (roles %v)", roles[ids[0]], roles)
 	}
 }
 
@@ -383,5 +407,249 @@ func TestAReplayStreamsARecordingAndStopsItsSessionAfterTheTurn(t *testing.T) {
 	}
 	if _, live := h.call("GET", "/api/voice/latency?group_by=source", nil, testPrincipal); len(live["groups"].([]any)) != 0 {
 		t.Fatalf("the live latency table counts the replay: %v", live)
+	}
+}
+
+// eventsWithin reads the utterance's event stream, from the start, for
+// duration, and answers what came.
+func (h *harness) eventsWithin(utteranceID string, duration time.Duration) []receivedEvent {
+	h.t.Helper()
+	request, _ := http.NewRequest("GET", h.server.URL+"/api/voice/utterances/"+utteranceID+"/events", nil)
+	request.Header.Set("X-Principal-Id", testPrincipal)
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+	response, err := http.DefaultClient.Do(request.WithContext(ctx))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var events []receivedEvent
+	scanner := bufio.NewScanner(response.Body)
+	name := ""
+	for scanner.Scan() {
+		line := scanner.Text()
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			name = strings.TrimPrefix(line, "event: ")
+		case strings.HasPrefix(line, "data: "):
+			data := map[string]any{}
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &data); err != nil {
+				h.t.Fatalf("event %s data: %v", name, err)
+			}
+			events = append(events, receivedEvent{name: name, data: data})
+		}
+	}
+	return events
+}
+
+// streamFrom posts pcm in 200 ms chunks starting at offset, and answers the
+// offset after it.
+func (h *harness) streamFrom(utteranceID string, offset int, pcm []byte) int {
+	h.t.Helper()
+	const chunk = 6400
+	for start := 0; start < len(pcm); start += chunk {
+		end := min(len(pcm), start+chunk)
+		if status, answer := h.postStream(utteranceID, offset+start, pcm[start:end]); status != http.StatusOK {
+			h.t.Fatalf("audio-stream at %d = %d %v", offset+start, status, answer)
+		}
+	}
+	return offset + len(pcm)
+}
+
+func TestAReplyWaitsWhileThePersonSpeaksAndMoreWordsInterruptItsTurn(t *testing.T) {
+	h, queue := newStreamingHarness(t, map[string]string{"VOICE_INTAKE_ENDPOINT_SILENCE_MS": "300"}, "what's the weather like", "in São Paulo")
+	// Slow enough that the speech after the pause is open before segment 0
+	// reaches its session.
+	queue.delay = 150 * time.Millisecond
+	h.bridge.resultWait = time.Hour
+	utteranceID := h.createStreamingUtterance("stream-held-reply", "quick", "endpoint")
+	offset := h.streamFrom(utteranceID, 0, pcmOf(audioPart{true, 600}, audioPart{false, 400}, audioPart{true, 400}))
+	waitFor(t, "segment 0 to reach its session", func() bool {
+		_, ids, sent, _ := h.bridge.snapshot()
+		return len(ids) == 1 && len(sent[ids[0]]) == 1
+	})
+	// The session's first block has come, and the person is still speaking.
+	waitFor(t, "the first block to be recorded", func() bool {
+		_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+		sessions, _ := record["sessions"].([]any)
+		return len(sessions) == 1 && sessions[0].(map[string]any)["first_block_at_ms"] != nil
+	})
+	if types := sessionEventTypes(h.eventsWithin(utteranceID, 200*time.Millisecond)); countOf(types, "block") != 0 {
+		t.Fatalf("session events %v were passed on while the person was speaking", types)
+	}
+	h.bridge.mutex.Lock()
+	h.bridge.resultWait = 20 * time.Millisecond
+	h.bridge.mutex.Unlock()
+	h.streamFrom(utteranceID, offset, pcmOf(audioPart{true, 400}, audioPart{false, 600}))
+	h.stop(utteranceID, StopReasonUser)
+	events := h.followUntilDone(utteranceID)
+
+	_, ids, sent, _ := h.bridge.snapshot()
+	if len(ids) != 1 || len(sent[ids[0]]) != 2 || sent[ids[0]][1] != "in São Paulo" {
+		t.Fatalf("sessions %v sent %v; want one session with both segments", ids, sent)
+	}
+	if interrupted := h.bridge.interruptedSessions(); len(interrupted) != 1 {
+		t.Fatalf("interrupted = %v; want the turn that was still running interrupted", interrupted)
+	}
+	types := sessionEventTypes(events)
+	if countOf(types, "block") != 1 || countOf(types, "result") != 1 {
+		t.Fatalf("session events passed on = %v; want only the second turn's block and result, the first turn's draft dropped", types)
+	}
+	if followUps := eventsNamed(events, eventFollowUp); len(followUps) != 1 || followUps[0].data["interrupted_reply"] != true {
+		t.Fatalf("follow_up events = %v", followUps)
+	}
+}
+
+func TestAQuickRecordingIsToldToStopAtTheLimitOfSegments(t *testing.T) {
+	h, _ := newStreamingHarness(t, map[string]string{"VOICE_INTAKE_ENDPOINT_SILENCE_MS": "300", "VOICE_INTAKE_MAXIMUM_QUICK_SEGMENTS": "2"}, "one", "two", "three")
+	utteranceID := h.createStreamingUtterance("stream-limit", "quick", "endpoint")
+	h.streamAll(utteranceID, pcmOf(audioPart{true, 600}, audioPart{false, 400}, audioPart{true, 600}, audioPart{false, 400}))
+	stops := eventsNamed(h.followUntil(utteranceID, eventStopRecording), eventStopRecording)
+	if len(stops) != 1 || stops[0].data["reason"] != StopReasonSegmentLimit {
+		t.Fatalf("stop_recording events = %v, want one for the limit of segments", stops)
+	}
+	if status, answer := h.stop(utteranceID, StopReasonSegmentLimit); status != http.StatusOK {
+		t.Fatalf("stop with the server's reason = %d %v", status, answer)
+	}
+	h.followUntilDone(utteranceID)
+	_, ids, sent, _ := h.bridge.snapshot()
+	if len(ids) != 1 || len(sent[ids[0]]) != 2 {
+		t.Fatalf("sessions %v sent %v; want one session with the two segments", ids, sent)
+	}
+}
+
+func TestWeaklyHeardNoiseNeitherKeepsTheWindowOpenNorCountsAsSpeech(t *testing.T) {
+	environment := map[string]string{"VOICE_INTAKE_ENDPOINT_SILENCE_MS": "300", "VOICE_INTAKE_CONTINUATION_WINDOW_MS": "1000",
+		"VOICE_INTAKE_NO_SPEECH_TIMEOUT_MS": "1500", "VOICE_INTAKE_MINIMUM_SEGMENT_MEAN_SPEECH_PROBABILITY": "0.95"}
+	weakThenQuiet := pcmOf(audioPart{true, 600}, audioPart{false, 400})
+
+	// One sure segment, then noise at every pause: the window still closes
+	// a second after the sure segment.
+	h, _ := newStreamingHarness(t, environment, "what time is it")
+	utteranceID := h.createStreamingUtterance("stream-noise-after-speech", "quick", "endpoint")
+	pcm := append(strongSpeechPCM(600), pcmOf(audioPart{false, 400})...)
+	for range 3 {
+		pcm = append(pcm, weakThenQuiet...)
+	}
+	h.streamAll(utteranceID, pcm)
+	stops := eventsNamed(h.followUntil(utteranceID, eventStopRecording), eventStopRecording)
+	if len(stops) != 1 || stops[0].data["reason"] != StopReasonContinuationWindowClosed {
+		t.Fatalf("stop_recording events = %v, want the window closed despite the noise", stops)
+	}
+	_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+	if received := record["stream_received_bytes"].(float64); received > float64(len(pcm)) {
+		t.Fatalf("received %v bytes", received)
+	}
+	h.stop(utteranceID, StopReasonContinuationWindowClosed)
+	h.followUntilDone(utteranceID)
+
+	// Noise alone is no speech.
+	h, _ = newStreamingHarness(t, environment)
+	utteranceID = h.createStreamingUtterance("stream-only-noise", "quick", "endpoint")
+	h.streamAll(utteranceID, append(append([]byte{}, weakThenQuiet...), weakThenQuiet...))
+	stops = eventsNamed(h.followUntil(utteranceID, eventStopRecording), eventStopRecording)
+	if len(stops) != 1 || stops[0].data["reason"] != StopReasonNoSpeech {
+		t.Fatalf("stop_recording events = %v, want no_speech for noise alone", stops)
+	}
+	h.stop(utteranceID, StopReasonNoSpeech)
+	h.followUntilDone(utteranceID)
+}
+
+func TestDoneWaitsForTheRecordingToStop(t *testing.T) {
+	// The window is long in audio time, so the stream sends no stop_recording
+	// here, and short enough in real time that a dispatcher clock of its own
+	// would close it before the test stops the recording.
+	h, _ := newStreamingHarness(t, map[string]string{"VOICE_INTAKE_ENDPOINT_SILENCE_MS": "300", "VOICE_INTAKE_CONTINUATION_WINDOW_MS": "700"}, "what time is it")
+	utteranceID := h.createStreamingUtterance("stream-done-after-stop", "quick", "endpoint")
+	h.streamAll(utteranceID, pcmOf(audioPart{true, 600}, audioPart{false, 600}))
+	waitFor(t, "the reply", func() bool {
+		_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+		sessions, _ := record["sessions"].([]any)
+		return len(sessions) == 1 && sessions[0].(map[string]any)["result_at_ms"] != nil
+	})
+	// The reply is in and the microphone is still open: done would close
+	// the event stream, and a later stop_recording would never arrive.
+	if done := eventsNamed(h.eventsWithin(utteranceID, 1600*time.Millisecond), eventDone); len(done) != 0 {
+		t.Fatal("done was sent while the recording still ran")
+	}
+	h.stop(utteranceID, StopReasonUser)
+	h.followUntilDone(utteranceID)
+}
+
+func TestAPhoneThatDoesNotStopWhenToldIsStoppedFromThisSide(t *testing.T) {
+	defer func(grace time.Duration) { stopRecordingGrace = grace }(stopRecordingGrace)
+	stopRecordingGrace = 100 * time.Millisecond
+	h, _ := newStreamingHarness(t, map[string]string{"VOICE_INTAKE_NO_SPEECH_TIMEOUT_MS": "1000"})
+	utteranceID := h.createStreamingUtterance("stream-unanswered-stop", "quick", "endpoint")
+	pcm := pcmOf(audioPart{false, 1200})
+	h.streamAll(utteranceID, pcm)
+	// The phone never posts stop.
+	events := h.followUntilDone(utteranceID)
+	if stops := eventsNamed(events, eventStopRecording); len(stops) != 1 {
+		t.Fatalf("stop_recording events = %v", stops)
+	}
+	if problems := eventsNamed(events, eventError); len(problems) == 0 || !strings.Contains(problems[0].data["message"].(string), "did not stop recording") {
+		t.Fatalf("error events = %v; want one saying the phone did not stop", problems)
+	}
+	_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+	if record["stop_reason"] != StopReasonStopRecordingUnanswered {
+		t.Fatalf("stop_reason = %v", record["stop_reason"])
+	}
+	if status, _ := h.postStream(utteranceID, len(pcm), pcmOf(audioPart{false, 200})); status != http.StatusConflict {
+		t.Fatalf("audio after this side stopped listening = %d, want 409", status)
+	}
+}
+
+func TestAStreamedRecordingNotMeantForTheAssistantIsToldToStopAndItsWordsWait(t *testing.T) {
+	h, _ := newStreamingHarness(t, map[string]string{"VOICE_INTAKE_ENDPOINT_SILENCE_MS": "300"}, "yeah they went over it yesterday", "oh no")
+	h.bridge.resultWait = time.Hour
+	utteranceID := h.createStreamingUtterance("stream-overheard", "quick", "endpoint")
+	offset := h.streamFrom(utteranceID, 0, pcmOf(audioPart{true, 600}, audioPart{false, 400}))
+	stops := eventsNamed(h.followUntil(utteranceID, eventStopRecording), eventStopRecording)
+	if len(stops) != 1 || stops[0].data["reason"] != StopReasonNotForAssistant {
+		t.Fatalf("stop_recording events = %v", stops)
+	}
+	// Words spoken before the phone stopped are held with the rest, and
+	// not sent to the session.
+	h.streamFrom(utteranceID, offset, pcmOf(audioPart{true, 600}, audioPart{false, 400}))
+	h.stop(utteranceID, StopReasonNotForAssistant)
+	withheld := eventsNamed(h.followUntil(utteranceID, eventNotForAssistant), eventNotForAssistant)
+	if len(withheld) != 1 || withheld[0].data["text"] != "yeah they went over it yesterday oh no" {
+		t.Fatalf("not_for_assistant events = %v; want every word heard", withheld)
+	}
+	_, ids, sent, _ := h.bridge.snapshot()
+	if len(ids) != 1 || len(sent[ids[0]]) != 1 {
+		t.Fatalf("sessions %v sent %v; want the one session, with only the first segment", ids, sent)
+	}
+	if shared := h.bridge.sharedInto(ids[0]); len(shared) != 0 {
+		t.Fatalf("the recording %v was shared into a session whose words were withheld", shared)
+	}
+	if status, answer := h.call("POST", "/api/voice/utterances/"+utteranceID+"/cancel", nil, testPrincipal); status != 200 {
+		t.Fatalf("cancel = %d %v", status, answer)
+	}
+	h.followUntilDone(utteranceID)
+	_, _, _, stopped := h.bridge.snapshot()
+	if !contains(stopped, ids[0]) {
+		t.Fatalf("stopped = %v; want %s stopped once the words were discarded", stopped, ids[0])
+	}
+}
+
+func TestAStreamThatGoesQuietWithoutAStopIsEndedFromThisSide(t *testing.T) {
+	defer func(limit time.Duration) { streamIdleLimit = limit }(streamIdleLimit)
+	streamIdleLimit = 150 * time.Millisecond
+	h, _ := newStreamingHarness(t, map[string]string{"VOICE_INTAKE_ENDPOINT_SILENCE_MS": "300"}, "what time is it")
+	utteranceID := h.createStreamingUtterance("stream-phone-vanished", "quick", "endpoint")
+	// The phone sends its speech and is never heard from again.
+	h.streamAll(utteranceID, pcmOf(audioPart{true, 600}, audioPart{false, 400}))
+	events := h.followUntilDone(utteranceID)
+	if results := countOf(sessionEventTypes(events), "result"); results != 1 {
+		t.Fatalf("%d results passed on, want the reply to what was heard", results)
+	}
+	if problems := eventsNamed(events, eventError); len(problems) != 1 || !strings.Contains(problems[0].data["message"].(string), "no audio arrived") {
+		t.Fatalf("error events = %v", problems)
+	}
+	_, record := h.call("GET", "/api/voice/utterances/"+utteranceID, nil, testPrincipal)
+	if record["stop_reason"] != StopReasonAudioStoppedArriving || record["finalized_at_ms"] == nil {
+		t.Fatalf("stop_reason = %v, finalized_at_ms = %v", record["stop_reason"], record["finalized_at_ms"])
 	}
 }

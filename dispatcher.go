@@ -25,6 +25,13 @@ const sessionTurnLimit = 5 * time.Minute
 // subscriber, so sending first loses no event; waiting only keeps it simple.
 const streamOpenWait = 5 * time.Second
 
+// interruptedTurnEndWait is how long a follow-up waits, after interrupting
+// the session's running turn, for that turn's own result before it is sent.
+// The bridge ends an interrupted turn with a result of its own, 50 to 80 ms
+// later when measured on 2026-11-25; sent before it, the new message's
+// echo comes first and that result would read as its reply.
+var interruptedTurnEndWait = 2 * time.Second
+
 // confirmationLimit is how long held words wait for the person to confirm
 // them before they expire, unsent.
 var confirmationLimit = 2 * time.Minute
@@ -39,11 +46,12 @@ var (
 // come for the message sent.
 var sessionStatesThatEndATurn = map[msg.SessionState]bool{msg.SessionAborted: true, msg.SessionError: true, msg.SessionDisconnected: true}
 
-// Dispatcher turns segments into sessions and decides which sessions to keep.
+// Dispatcher sends an utterance's segments to its one session and follows
+// the replies.
 type Dispatcher struct {
 	store          *Store
 	bridge         SessionBridge
-	judge          ContinuationJudge
+	addresseeJudge AddresseeJudge
 	pool           *SessionPool
 	settings       func() DispatchSettings
 	now            func() time.Time
@@ -60,8 +68,8 @@ type Dispatcher struct {
 }
 
 // NewDispatcher builds a dispatcher.
-func NewDispatcher(store *Store, bridge SessionBridge, judge ContinuationJudge, pool *SessionPool, settings func() DispatchSettings, now func() time.Time, audioDirectory string) *Dispatcher {
-	return &Dispatcher{store: store, bridge: bridge, judge: judge, pool: pool, settings: settings, now: now, audioDirectory: audioDirectory,
+func NewDispatcher(store *Store, bridge SessionBridge, addresseeJudge AddresseeJudge, pool *SessionPool, settings func() DispatchSettings, now func() time.Time, audioDirectory string) *Dispatcher {
+	return &Dispatcher{store: store, bridge: bridge, addresseeJudge: addresseeJudge, pool: pool, settings: settings, now: now, audioDirectory: audioDirectory,
 		runs: map[string]*utteranceRun{}}
 }
 
@@ -94,14 +102,6 @@ type dispatchOverrides struct {
 	warmSessionID string
 }
 
-// requestGroup is one request the utterance holds: the segments read as one
-// message, and the session answering it.
-type requestGroup struct {
-	segmentIndexes []int
-	text           string
-	sessionID      string
-}
-
 // runSession is a dispatched session as the run tracks it.
 type runSession struct {
 	sessionID      string
@@ -119,6 +119,38 @@ type runSession struct {
 	// stream: a new subscriber is first sent the session's last turn again,
 	// whose result is not the reply to these words.
 	awaitingOwnMessage bool
+	// awaitedText, when set, is the message awaitingOwnMessage waits for:
+	// only a user_message with this text ends the wait. The bridge can echo
+	// one message twice, about a second apart, so the echo of an earlier
+	// message must not end it.
+	awaitedText string
+	// discarding drops every event: the running turn was interrupted and
+	// its last events are still arriving.
+	discarding bool
+	// resultsSeen counts the result events read, passed on or not.
+	resultsSeen int
+	// turnMessageIDs are the assistant message ids of the turn now running,
+	// and interruptedMessageIDs those of turns that were interrupted: a
+	// block or result that carries one of the latter is that turn's, however
+	// late it comes, and is never passed on. The bridge's turn_id cannot
+	// tell them apart: after an interrupt it stamps the old turn's last
+	// events with the new turn's id.
+	turnMessageIDs        map[string]bool
+	interruptedMessageIDs map[string]bool
+	// reading is true while a goroutine reads the session's events.
+	reading bool
+	// replyForwarded is true once an event of the turn now running has been
+	// passed on to the phone.
+	replyForwarded bool
+	// heldEvents are events of the turn now running, kept back while the
+	// person is still speaking: more words may change the request.
+	heldEvents []json.RawMessage
+	// withheld drops the session's events: the addressee check judged the
+	// words were not meant for the assistant.
+	withheld bool
+	// followUpSequence is the session_follow_ups row of the turn now
+	// running; zero while the first message's turn runs.
+	followUpSequence int64
 }
 
 type utteranceAudio struct {
@@ -138,30 +170,61 @@ type utteranceRun struct {
 	stopped     chan struct{}
 	stopOnce    sync.Once
 
-	mutex       sync.Mutex
-	segments    map[int]Segment
-	nextIndex   int
-	groups      []*requestGroup
-	sessions    map[string]*runSession
-	order       []string
-	final       bool
-	canceled    bool
-	windowTimer *time.Timer
-	audio       *utteranceAudio
-	mode        string
-	stream      *audioStream
-	overrides   *dispatchOverrides
-	// target is where the words go. For a session or signal target the
-	// spoken segments are kept here, in order, and sent as one message when
-	// the utterance finishes.
+	mutex     sync.Mutex
+	segments  map[int]Segment
+	nextIndex int
+	// conversation is the utterance's one session (targets pool and
+	// new_session): the first segment with words starts it, and every later
+	// one goes into it as its next message.
+	conversation *runSession
+	// sentSegments counts the segments with words sent to conversation.
+	sentSegments int
+	// segmentLimitReported is set once the limit of segments has been
+	// reported, so it is reported once.
+	segmentLimitReported bool
+	sessions             map[string]*runSession
+	order                []string
+	final                bool
+	canceled             bool
+	windowTimer          *time.Timer
+	audio                *utteranceAudio
+	mode                 string
+	trigger              string
+	stream               *audioStream
+	overrides            *dispatchOverrides
+	// speechOpen is true while the stream's detector hears a segment of
+	// speech not yet ended; segmentsCut counts the segments the stream has
+	// cut. While speech is open, or a cut segment is not handled yet, the
+	// session's events are held back (replyHeldBack).
+	speechOpen  bool
+	segmentsCut int
+	// finishSeen is set once Finish has handled every segment: no more
+	// words will come.
+	finishSeen bool
+	// target is where the words go. spokenTexts holds every segment with
+	// words handled so far, in order: a session or signal target sends them
+	// as one message when the utterance finishes, the addressee check reads
+	// them, and they are the words held for confirmation.
 	target          UtteranceTarget
-	targetTexts     []string
+	spokenTexts     []string
 	targetDelivered bool
 	// confirmBeforeSend holds the joined words at finish until the person
 	// confirms them; confirmationTimer expires them.
 	confirmBeforeSend bool
 	held              bool
 	confirmationTimer *time.Timer
+	// confirmationOpen is true while held words wait for the person: done
+	// is not sent until that ends.
+	confirmationOpen bool
+	// addresseeCheckRunning is true while the addressee check reads the
+	// words; addresseeCheckStale is set when more words came meanwhile, so
+	// it runs again on all of them. notForAssistant is set once it judged
+	// the words were not meant for the assistant, with its reason and model.
+	addresseeCheckRunning bool
+	addresseeCheckStale   bool
+	notForAssistant       bool
+	notForAssistantReason string
+	notForAssistantModel  string
 }
 
 // collectsOneMessage reports whether the segments are kept and sent joined
@@ -183,7 +246,7 @@ func (d *Dispatcher) runFor(utterance Utterance) (*utteranceRun, error) {
 	if target.Kind == "" {
 		target = PoolTarget
 	}
-	run := &utteranceRun{dispatcher: d, utteranceID: utterance.UtteranceID, principalID: utterance.PrincipalID, hub: newEventHub(), mode: utterance.Mode,
+	run := &utteranceRun{dispatcher: d, utteranceID: utterance.UtteranceID, principalID: utterance.PrincipalID, hub: newEventHub(), mode: utterance.Mode, trigger: utterance.Trigger,
 		jobs: make(chan func(), 64), stopped: make(chan struct{}), segments: map[int]Segment{}, sessions: map[string]*runSession{}, target: target,
 		confirmBeforeSend: utterance.ConfirmBeforeSend && target.heldForConfirmation()}
 	if err := run.loadFromStore(utterance); err != nil {
@@ -222,6 +285,10 @@ func (run *utteranceRun) loadFromStore(utterance Utterance) error {
 			role: session.Role, turnFinished: true, stopped: session.StoppedAtMs != nil, ownedByVoiceIntake: run.target.Kind != TargetSession && run.target.Kind != TargetSignal}
 		run.order = append(run.order, session.SessionID)
 		run.hub.publish(eventDispatch, dispatchEventData(session.SessionID, session.SegmentIndexes, session.Text))
+		if !run.target.deliversOneMessage() && session.Role != RoleSuperseded {
+			run.conversation = run.sessions[session.SessionID]
+			run.sentSegments = len(session.SegmentIndexes) + len(session.FollowUps)
+		}
 	}
 	decisions, err := run.dispatcher.store.Decisions(utterance.UtteranceID)
 	if err != nil {
@@ -236,8 +303,24 @@ func (run *utteranceRun) loadFromStore(utterance Utterance) error {
 	run.targetDelivered = run.collectsOneMessage() && len(sessions) > 0
 	run.held = utterance.ConfirmationState != ""
 	if utterance.ConfirmationState == ConfirmationAwaiting {
-		run.targetTexts = []string{utterance.ConfirmationText}
+		run.spokenTexts = []string{utterance.ConfirmationText}
 	}
+	if utterance.ConfirmationReason == ConfirmationReasonNotForAssistant {
+		run.notForAssistant = true
+		checks, err := run.dispatcher.store.AddresseeChecks(utterance.UtteranceID)
+		if err != nil {
+			return err
+		}
+		for _, check := range checks {
+			if check.ForAssistant != nil && !*check.ForAssistant {
+				run.notForAssistantReason, run.notForAssistantModel = check.Reason, check.Model
+			}
+		}
+		if run.conversation != nil && utterance.ConfirmationState != ConfirmationConfirmed {
+			run.conversation.withheld = true
+		}
+	}
+	run.finishSeen = utterance.FinishedAtMs != nil || utterance.StoppedAtMs != nil
 	return nil
 }
 
@@ -297,10 +380,23 @@ func (d *Dispatcher) Finish(utterance Utterance) error {
 	}
 	run.enqueue(func() {
 		run.processReadySegments()
+		run.mutex.Lock()
+		run.finishSeen = true
+		notForAssistant := run.notForAssistant
+		run.mutex.Unlock()
+		// Whatever happens next, a later checkDone must not wait on a
+		// recording that has now stopped.
+		defer run.checkDone()
 		if run.confirmBeforeSend {
 			// Nothing is sent, and nothing final, until the person confirms
 			// the words, cancels them, or lets them expire.
-			run.holdForConfirmation()
+			run.holdForConfirmation("")
+			return
+		}
+		if notForAssistant {
+			// The addressee check withheld the words while the recording
+			// ran: now that every word is in, they wait for the person.
+			run.holdForConfirmation(ConfirmationReasonNotForAssistant)
 			return
 		}
 		if run.target.deliversOneMessage() {
@@ -312,9 +408,11 @@ func (d *Dispatcher) Finish(utterance Utterance) error {
 }
 
 // holdForConfirmation keeps the joined words for the person to confirm and
-// tells the phone. With no words there is nothing to confirm and the
-// utterance ends. Run on the worker.
-func (run *utteranceRun) holdForConfirmation() {
+// tells the phone. reason is empty for a hold the client asked for, and
+// ConfirmationReasonNotForAssistant when the addressee check withheld the
+// words. With no words there is nothing to confirm and the utterance ends.
+// Run on the worker.
+func (run *utteranceRun) holdForConfirmation(reason string) {
 	d := run.dispatcher
 	run.mutex.Lock()
 	if run.held || run.canceled {
@@ -322,7 +420,7 @@ func (run *utteranceRun) holdForConfirmation() {
 		return
 	}
 	run.held = true
-	text := strings.Join(run.targetTexts, " ")
+	text := strings.Join(run.spokenTexts, " ")
 	target := run.target
 	run.mutex.Unlock()
 	if strings.TrimSpace(text) == "" {
@@ -331,8 +429,9 @@ func (run *utteranceRun) holdForConfirmation() {
 		return
 	}
 	expiresAtMs := d.now().Add(confirmationLimit).UnixMilli()
-	if err := d.store.HoldForConfirmation(run.utteranceID, text, expiresAtMs); err != nil {
+	if err := d.store.HoldForConfirmation(run.utteranceID, text, expiresAtMs, reason); err != nil {
 		run.recordError(fmt.Sprintf("hold the words for confirmation: %v; nothing was sent", err))
+		run.stopWithheldConversation("the words could not be held for confirmation")
 		run.finalize("the words could not be held for confirmation")
 		return
 	}
@@ -340,13 +439,48 @@ func (run *utteranceRun) holdForConfirmation() {
 }
 
 // awaitConfirmation tells the phone what is held and starts the expiry.
+// Words the client asked to confirm go out as awaiting_confirmation; words
+// the addressee check withheld go out as not_for_assistant, which a client
+// must never send by itself.
 func (run *utteranceRun) awaitConfirmation(text string, expiresAtMs int64) {
 	d := run.dispatcher
-	run.hub.publish(eventAwaitingConfirmation, map[string]any{"text": text, "expires_at_ms": expiresAtMs})
+	run.mutex.Lock()
+	run.confirmationOpen = true
+	notForAssistant, reason, model := run.notForAssistant, run.notForAssistantReason, run.notForAssistantModel
+	run.mutex.Unlock()
+	if notForAssistant {
+		run.hub.publish(eventNotForAssistant, map[string]any{"text": text, "reason": reason, "model": model, "expires_at_ms": expiresAtMs})
+	} else {
+		run.hub.publish(eventAwaitingConfirmation, map[string]any{"text": text, "expires_at_ms": expiresAtMs})
+	}
 	wait := max(0, time.UnixMilli(expiresAtMs).Sub(d.now()))
 	run.mutex.Lock()
 	run.confirmationTimer = time.AfterFunc(wait, run.expireConfirmation)
 	run.mutex.Unlock()
+}
+
+// endConfirmation records that held words stopped waiting, so done may be
+// sent again.
+func (run *utteranceRun) endConfirmation() {
+	run.mutex.Lock()
+	run.confirmationOpen = false
+	if run.confirmationTimer != nil {
+		run.confirmationTimer.Stop()
+	}
+	run.mutex.Unlock()
+}
+
+// stopWithheldConversation stops and archives the session of words the
+// addressee check withheld and nobody sent anyway. Without such a session
+// it does nothing.
+func (run *utteranceRun) stopWithheldConversation(why string) {
+	run.mutex.Lock()
+	session := run.conversation
+	withheld := run.notForAssistant && session != nil
+	run.mutex.Unlock()
+	if withheld {
+		run.decide(session.sessionID, RoleSuperseded, why)
+	}
 }
 
 // expireConfirmation ends held words nobody confirmed: recorded as
@@ -361,9 +495,12 @@ func (run *utteranceRun) expireConfirmation() {
 	if !won {
 		return
 	}
+	run.endConfirmation()
 	run.hub.publish(eventConfirmationEnded, map[string]any{"state": ConfirmationExpired})
 	run.enqueue(func() {
-		run.finalize(fmt.Sprintf("nobody confirmed the words within %s, so nothing was sent", confirmationLimit))
+		why := fmt.Sprintf("nobody confirmed the words within %s, so nothing was sent", confirmationLimit)
+		run.stopWithheldConversation("the addressee check judged the words were not meant for the assistant, and " + why)
+		run.finalize(why)
 	})
 }
 
@@ -391,11 +528,7 @@ func (d *Dispatcher) ConfirmHeldWords(utterance Utterance, text *string) error {
 	if !won {
 		return fmt.Errorf("%w (it ended as this confirm arrived)", ErrNothingAwaitingConfirmation)
 	}
-	run.mutex.Lock()
-	if run.confirmationTimer != nil {
-		run.confirmationTimer.Stop()
-	}
-	run.mutex.Unlock()
+	run.endConfirmation()
 	run.hub.publish(eventConfirmationEnded, map[string]any{"state": ConfirmationConfirmed})
 	run.enqueue(func() {
 		run.sendHeldWords()
@@ -405,8 +538,16 @@ func (d *Dispatcher) ConfirmHeldWords(utterance Utterance, text *string) error {
 }
 
 // sendHeldWords sends confirmed words: to the session or signal the phone
-// named, or to a new chat session. Run on the worker.
+// named, to a new chat session, or, for words the addressee check withheld,
+// into the utterance's one session. Run on the worker.
 func (run *utteranceRun) sendHeldWords() {
+	run.mutex.Lock()
+	notForAssistant := run.notForAssistant
+	run.mutex.Unlock()
+	if notForAssistant {
+		run.sendWithheldWords()
+		return
+	}
 	if run.target.Kind != TargetNewSession {
 		run.deliverToTarget()
 		return
@@ -417,7 +558,7 @@ func (run *utteranceRun) sendHeldWords() {
 		return
 	}
 	run.targetDelivered = true
-	text := strings.Join(run.targetTexts, " ")
+	text := strings.Join(run.spokenTexts, " ")
 	indexes := run.spokenIndexes()
 	run.mutex.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -451,11 +592,7 @@ func (d *Dispatcher) Cancel(utterance Utterance) error {
 		return err
 	}
 	if won {
-		run.mutex.Lock()
-		if run.confirmationTimer != nil {
-			run.confirmationTimer.Stop()
-		}
-		run.mutex.Unlock()
+		run.endConfirmation()
 		run.hub.publish(eventConfirmationEnded, map[string]any{"state": ConfirmationCanceled})
 	}
 	run.cancel()
@@ -487,18 +624,15 @@ func (run *utteranceRun) processReadySegments() {
 		// and changes nothing else: no dispatch, and the continuation
 		// window still runs from the last segment that had words.
 		spoken := hasWords(segment)
-		if run.collectsOneMessage() {
-			// Kept for the one message sent at finish (or at confirmation);
-			// no window runs, since nothing is split or judged.
-			run.mutex.Lock()
-			if spoken {
-				run.targetTexts = append(run.targetTexts, strings.TrimSpace(segment.Text))
-			}
-			run.nextIndex = segment.Index + 1
-			run.mutex.Unlock()
-			continue
-		}
 		if spoken {
+			run.mutex.Lock()
+			run.spokenTexts = append(run.spokenTexts, strings.TrimSpace(segment.Text))
+			run.mutex.Unlock()
+		}
+		if spoken && !run.collectsOneMessage() {
+			// A session or signal target, and any utterance whose words wait
+			// for confirmation, sends nothing here: spokenTexts goes as one
+			// message at finish, or at confirmation.
 			run.mutex.Lock()
 			overrides := run.overrides
 			run.mutex.Unlock()
@@ -513,7 +647,10 @@ func (run *utteranceRun) processReadySegments() {
 		run.mutex.Lock()
 		run.nextIndex = segment.Index + 1
 		run.mutex.Unlock()
-		if spoken {
+		// This segment is handled: a reply kept back while it was spoken
+		// and transcribed may go out, unless more speech is on its way.
+		run.releaseHeldReplies(false)
+		if spoken && !run.collectsOneMessage() {
 			run.scheduleWindowExpiry(segment)
 		}
 	}
@@ -536,6 +673,11 @@ func (run *utteranceRun) previousSpokenSegment(index int) (Segment, bool) {
 	return Segment{}, false
 }
 
+// processSegment sends a segment with words to the utterance's one session:
+// the first starts it, and each later one goes into it as its next message.
+// The session has every earlier word, so it is the one to judge whether the
+// new ones continue the request, change it or ask something new. Run on the
+// worker.
 func (run *utteranceRun) processSegment(segment Segment) {
 	d := run.dispatcher
 	settings := d.settings()
@@ -543,131 +685,372 @@ func (run *utteranceRun) processSegment(segment Segment) {
 	defer cancel()
 
 	run.mutex.Lock()
-	var last *requestGroup
-	if len(run.groups) > 0 {
-		last = run.groups[len(run.groups)-1]
+	conversation := run.conversation
+	withheld := run.notForAssistant
+	// A streamed recording counts its segments itself and is told to stop at
+	// the limit; segments the phone cuts are counted here.
+	limit := 0
+	if run.mode != "long" && run.stream == nil && run.overrides == nil {
+		limit = settings.MaximumQuickSegments
 	}
-	previous, havePrevious := run.previousSpokenSegment(segment.Index)
-	final := run.final
+	overLimit := limit > 0 && run.sentSegments >= limit
+	alreadyReported := run.segmentLimitReported
+	if overLimit {
+		run.segmentLimitReported = true
+	}
 	run.mutex.Unlock()
-
-	if last == nil {
-		session, err := run.dispatch(ctx, []int{segment.Index}, segment.Text)
-		if err == nil {
-			run.appendGroup(&requestGroup{segmentIndexes: []int{segment.Index}, text: segment.Text, sessionID: session.sessionID})
+	if withheld {
+		// The addressee check withheld the words: these are kept in
+		// spokenTexts with the rest, for the person to send anyway.
+		return
+	}
+	if overLimit {
+		if !alreadyReported {
+			run.recordError(fmt.Sprintf("segment %d and any after it were not sent: one quick recording sends at most %d segments (%s)",
+				segment.Index, limit, SettingMaximumQuickSegments))
 		}
 		return
 	}
 
-	gapMs := int64(-1)
-	if havePrevious {
-		gapMs = segment.ReceivedAtMs - previous.SpeechEndedAtMs
-	}
-	windowMs := settings.ContinuationWindow.Milliseconds()
-	if final || !havePrevious || gapMs > windowMs {
-		why := "the utterance's decisions were already final"
-		if !final && !havePrevious {
-			why = fmt.Sprintf("no segment with words before segment %d was handled by this process", segment.Index)
-		} else if !final {
-			why = fmt.Sprintf("segment %d arrived %d ms after segment %d's speech end, past the %d ms continuation window", segment.Index, gapMs, previous.Index, windowMs)
-		}
-		run.decide(last.sessionID, RoleKept, "no later segment continued it: "+why)
+	if conversation == nil {
 		session, err := run.dispatch(ctx, []int{segment.Index}, segment.Text)
-		if err == nil {
-			run.decide(session.sessionID, RoleSeparate, why)
-			run.appendGroup(&requestGroup{segmentIndexes: []int{segment.Index}, text: segment.Text, sessionID: session.sessionID})
+		if err != nil {
+			return
 		}
-		return
-	}
-
-	joinedIndexes := append(append([]int(nil), last.segmentIndexes...), segment.Index)
-	joinedText := strings.TrimSpace(last.text + " " + segment.Text)
-	var joined, alone *runSession
-	var verdict ContinuationVerdict
-	var judgeErr error
-	var waitGroup sync.WaitGroup
-	waitGroup.Add(3)
-	go func() { defer waitGroup.Done(); joined, _ = run.dispatch(ctx, joinedIndexes, joinedText) }()
-	go func() { defer waitGroup.Done(); alone, _ = run.dispatch(ctx, []int{segment.Index}, segment.Text) }()
-	go func() {
-		defer waitGroup.Done()
-		verdict, judgeErr = run.askJudge(ctx, settings.JudgeModelRole, segment.Index, last.text, segment.Text)
-	}()
-	waitGroup.Wait()
-
-	judgeSaid := ""
-	switch {
-	case judgeErr != nil:
-		judgeSaid = "the continuation judge failed (" + judgeErr.Error() + ")"
-	case verdict.Continues:
-		judgeSaid = fmt.Sprintf("the judge (%s) said segment %d continues the earlier request: %s", verdict.Model, segment.Index, verdict.Reason)
-	default:
-		judgeSaid = fmt.Sprintf("the judge (%s) said segment %d is a separate request: %s", verdict.Model, segment.Index, verdict.Reason)
-	}
-	keepJoined := joined != nil && (judgeErr != nil || verdict.Continues || alone == nil)
-	switch {
-	case keepJoined:
-		reason := judgeSaid
-		if judgeErr != nil {
-			reason += "; kept the joined text, which carries every word"
-		} else if !verdict.Continues {
-			reason += "; but the session for segment alone could not be started, so the joined text is kept"
-		}
-		run.decide(joined.sessionID, RoleKept, reason)
-		run.decide(last.sessionID, RoleSuperseded, reason)
-		if alone != nil {
-			run.decide(alone.sessionID, RoleSuperseded, reason)
-		}
-		run.replaceLastGroup(&requestGroup{segmentIndexes: joinedIndexes, text: joinedText, sessionID: joined.sessionID})
-	case alone != nil:
-		reason := judgeSaid
-		if joined == nil && verdict.Continues {
-			reason += "; but the joined session could not be started, so the two are kept apart"
-		}
-		run.decide(last.sessionID, RoleKept, reason)
-		run.decide(alone.sessionID, RoleSeparate, reason)
-		if joined != nil {
-			run.decide(joined.sessionID, RoleSuperseded, reason)
-		}
-		run.appendGroup(&requestGroup{segmentIndexes: []int{segment.Index}, text: segment.Text, sessionID: alone.sessionID})
-	default:
-		run.recordError(fmt.Sprintf("segment %d: neither the joined session nor the session for it alone could be started; the earlier request stands as it was", segment.Index))
-	}
-}
-
-func (run *utteranceRun) appendGroup(group *requestGroup) {
-	run.mutex.Lock()
-	run.groups = append(run.groups, group)
-	run.mutex.Unlock()
-}
-
-func (run *utteranceRun) replaceLastGroup(group *requestGroup) {
-	run.mutex.Lock()
-	run.groups[len(run.groups)-1] = group
-	run.mutex.Unlock()
-}
-
-func (run *utteranceRun) askJudge(ctx context.Context, modelRole string, segmentIndex int, earlierText, newText string) (ContinuationVerdict, error) {
-	d := run.dispatcher
-	started := d.now()
-	judgeContext, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	verdict, err := d.judge.Judge(judgeContext, modelRole, earlierText, newText)
-	judgment := ContinuationJudgment{SegmentIndex: segmentIndex, EarlierText: earlierText, NewText: newText, ModelRole: modelRole,
-		StartedAtMs: started.UnixMilli(), DurationMs: d.now().Sub(started).Milliseconds()}
-	if err != nil {
-		judgment.Error = err.Error()
-		log.Printf("[dispatch] ERROR %s segment %d: continuation judge: %v", run.utteranceID, segmentIndex, err)
+		run.mutex.Lock()
+		run.conversation = session
+		run.sentSegments++
+		run.mutex.Unlock()
+		run.decide(session.sessionID, RoleKept, "one press, one session: every later segment goes into it as its next message")
 	} else {
-		continues := verdict.Continues
-		judgment.Continues = &continues
-		judgment.Reason = verdict.Reason
-		judgment.Model = verdict.Model
+		if !run.sendIntoConversation(ctx, conversation, []int{segment.Index}, segment.Text) {
+			return
+		}
+		run.mutex.Lock()
+		run.sentSegments++
+		run.mutex.Unlock()
 	}
-	if storeErr := d.store.InsertContinuationJudgment(run.utteranceID, judgment); storeErr != nil {
-		log.Printf("[dispatch] ERROR %s: record judgment: %v", run.utteranceID, storeErr)
+	run.checkAddressee()
+}
+
+// sendIntoConversation sends text into the utterance's one session as its
+// next message. A turn still running is interrupted first and whatever of
+// its reply was kept back is dropped: the new words may change the request,
+// so the session answers all of it afresh. A turn that had finished keeps
+// its reply. It reports whether the text went.
+func (run *utteranceRun) sendIntoConversation(ctx context.Context, session *runSession, segmentIndexes []int, text string) bool {
+	d := run.dispatcher
+	run.mutex.Lock()
+	if session.stopped || run.canceled {
+		stopped := session.stopped
+		run.mutex.Unlock()
+		if stopped {
+			run.recordError(fmt.Sprintf("segments %v were not sent: session %s has been stopped", segmentIndexes, session.sessionID))
+		}
+		return false
 	}
-	return verdict, err
+	interruptedReply := !session.turnFinished
+	resultsBefore := session.resultsSeen
+	if interruptedReply {
+		// Until the interrupted turn has ended, nothing of it is passed on.
+		session.discarding = true
+		if session.interruptedMessageIDs == nil {
+			session.interruptedMessageIDs = map[string]bool{}
+		}
+		for messageID := range session.turnMessageIDs {
+			session.interruptedMessageIDs[messageID] = true
+		}
+	} else if !session.withheld {
+		// The earlier turn finished while the person was still speaking and
+		// its reply was kept back. The session answers the new words as one
+		// who has said it, so it goes to the phone first.
+		for _, event := range session.heldEvents {
+			run.hub.publish(eventSessionEvent, map[string]any{"session_id": session.sessionID, "event": event})
+		}
+	}
+	// What is left is the draft of a turn about to be interrupted, or of
+	// words withheld: it is dropped.
+	session.heldEvents = nil
+	session.turnMessageIDs = nil
+	session.replyForwarded = false
+	session.withheld = false
+	run.mutex.Unlock()
+
+	if interruptedReply {
+		if err := d.bridge.InterruptSession(ctx, session.sessionID); err != nil {
+			// The turn ending by itself as the interrupt was sent is the
+			// usual cause, and then there is nothing to interrupt.
+			log.Printf("[dispatch] %s: interrupt %s before segments %v: %v", run.utteranceID, session.sessionID, segmentIndexes, err)
+		} else {
+			run.awaitInterruptedTurnEnd(session, resultsBefore)
+		}
+	}
+	run.mutex.Lock()
+	session.discarding = false
+	// From here nothing is passed on until the message sent below shows on
+	// the stream.
+	session.awaitingOwnMessage = true
+	session.awaitedText = strings.TrimSpace(text)
+	session.turnFinished = false
+	run.mutex.Unlock()
+	sequence, err := d.store.InsertSessionFollowUp(run.utteranceID, SessionFollowUp{SessionID: session.sessionID, SegmentIndexes: segmentIndexes,
+		Text: text, InterruptedReply: interruptedReply, SentAtMs: d.now().UnixMilli()})
+	if err != nil {
+		log.Printf("[dispatch] ERROR %s: record follow-up to %s: %v", run.utteranceID, session.sessionID, err)
+	}
+	run.mutex.Lock()
+	session.followUpSequence = sequence
+	run.mutex.Unlock()
+	run.readSession(session)
+
+	if err := d.bridge.SendMessage(ctx, session.sessionID, text); err != nil {
+		run.recordError(fmt.Sprintf("segments %v: send to %s: %v", segmentIndexes, session.sessionID, err))
+		if sequence != 0 {
+			if storeErr := d.store.SetFollowUpError(sequence, err.Error()); storeErr != nil {
+				log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, storeErr)
+			}
+		}
+		run.mutex.Lock()
+		session.awaitingOwnMessage = false
+		session.turnFinished = true
+		run.mutex.Unlock()
+		run.checkDone()
+		return false
+	}
+	run.hub.publish(eventFollowUp, map[string]any{"session_id": session.sessionID, "segment_indexes": segmentIndexes, "text": text,
+		"interrupted_reply": interruptedReply})
+	return true
+}
+
+// awaitInterruptedTurnEnd waits for the result that ends a turn just
+// interrupted, so the next message is sent after it. resultsBefore is the
+// count of results read when the turn was found running.
+func (run *utteranceRun) awaitInterruptedTurnEnd(session *runSession, resultsBefore int) {
+	deadline := time.Now().Add(interruptedTurnEndWait)
+	for {
+		run.mutex.Lock()
+		ended := session.resultsSeen > resultsBefore || session.stopped || !session.reading
+		run.mutex.Unlock()
+		if ended {
+			return
+		}
+		if time.Now().After(deadline) {
+			log.Printf("[dispatch] %s: the interrupted turn of %s sent no result within %s; sending the next message anyway", run.utteranceID, session.sessionID, interruptedTurnEndWait)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// readSession starts reading a session's events, unless a reader already
+// runs, and waits a moment for the stream to open.
+func (run *utteranceRun) readSession(session *runSession) {
+	run.mutex.Lock()
+	if session.reading {
+		run.mutex.Unlock()
+		return
+	}
+	session.reading = true
+	streamContext, cancelStream := context.WithTimeout(context.Background(), sessionTurnLimit)
+	session.cancelStream = cancelStream
+	run.mutex.Unlock()
+	connected, streamEnded := make(chan struct{}), make(chan struct{})
+	go run.streamSession(streamContext, session, connected, streamEnded)
+	select {
+	case <-connected:
+	case <-streamEnded:
+	case <-time.After(streamOpenWait):
+		log.Printf("[dispatch] %s: the event stream of %s did not open in %s; sending anyway", run.utteranceID, session.sessionID, streamOpenWait)
+	}
+}
+
+// replyHeldBack reports whether session events wait instead of going to the
+// phone: the person is speaking, or a segment already cut has not been
+// handled, so words that may change the request are on their way. The
+// caller holds run.mutex.
+func (run *utteranceRun) replyHeldBack() bool {
+	return run.speechOpen || run.segmentsCut > run.nextIndex
+}
+
+// releaseHeldReplies passes on the session events kept back while the
+// person spoke, once nothing more is on its way; force passes them on
+// whatever the state, for the end of the utterance.
+func (run *utteranceRun) releaseHeldReplies(force bool) {
+	run.mutex.Lock()
+	defer run.mutex.Unlock()
+	if !force && run.replyHeldBack() {
+		return
+	}
+	for _, sessionID := range run.order {
+		session := run.sessions[sessionID]
+		held := session.heldEvents
+		session.heldEvents = nil
+		if len(held) == 0 || session.role == RoleSuperseded || session.stopped || session.withheld {
+			continue
+		}
+		session.replyForwarded = true
+		// Published under run.mutex, as streamSession does, so a held event
+		// never goes out after a later one.
+		for _, event := range held {
+			run.hub.publish(eventSessionEvent, map[string]any{"session_id": session.sessionID, "event": event})
+		}
+	}
+}
+
+// speechHeard records whether the stream's detector has a segment of speech
+// open, and lets held replies out when it closes with nothing cut.
+func (run *utteranceRun) speechHeard(open bool) {
+	run.mutex.Lock()
+	changed := run.speechOpen != open
+	run.speechOpen = open
+	run.mutex.Unlock()
+	if changed && !open {
+		run.releaseHeldReplies(false)
+	}
+}
+
+// segmentCut records that the stream has cut segment index, which will reach
+// the worker once it is transcribed.
+func (run *utteranceRun) segmentCut(index int) {
+	run.mutex.Lock()
+	if index+1 > run.segmentsCut {
+		run.segmentsCut = index + 1
+	}
+	run.mutex.Unlock()
+}
+
+// checkAddressee asks, beside the session, whether the words so far were
+// meant for the assistant. One check runs at a time; words that arrive
+// while it runs make it run again on all of them. Typed words, replays and
+// words the person has already confirmed are not checked.
+func (run *utteranceRun) checkAddressee() {
+	d := run.dispatcher
+	run.mutex.Lock()
+	if d.addresseeJudge == nil || run.overrides != nil || run.trigger == TriggerKeyboard || run.notForAssistant || run.held || run.canceled {
+		run.mutex.Unlock()
+		return
+	}
+	if run.addresseeCheckRunning {
+		run.addresseeCheckStale = true
+		run.mutex.Unlock()
+		return
+	}
+	run.addresseeCheckRunning = true
+	run.addresseeCheckStale = false
+	text := strings.Join(run.spokenTexts, " ")
+	run.mutex.Unlock()
+
+	modelRole := d.settings().AddresseeCheckModelRole
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), addresseeCheckLimit)
+		defer cancel()
+		started := d.now()
+		verdict, err := d.addresseeJudge.Judge(ctx, modelRole, text)
+		check := AddresseeCheck{Text: text, ModelRole: modelRole, StartedAtMs: started.UnixMilli(), DurationMs: d.now().Sub(started).Milliseconds()}
+		if err != nil {
+			check.Error = err.Error()
+		} else {
+			forAssistant := verdict.ForAssistant
+			check.ForAssistant, check.Reason, check.Model = &forAssistant, verdict.Reason, verdict.Model
+		}
+		if storeErr := d.store.InsertAddresseeCheck(run.utteranceID, check); storeErr != nil {
+			log.Printf("[dispatch] ERROR %s: record addressee check: %v", run.utteranceID, storeErr)
+		}
+		run.mutex.Lock()
+		run.addresseeCheckRunning = false
+		stale := run.addresseeCheckStale
+		run.mutex.Unlock()
+		switch {
+		case err != nil:
+			// The words were sent as they were; the person is told the
+			// check did not run, so its silence is not read as approval.
+			run.recordError(fmt.Sprintf("the check of whether the words were meant for the assistant did not run, so they were sent unchecked: %v", err))
+			if stale {
+				run.checkAddressee()
+			}
+		case !verdict.ForAssistant:
+			run.enqueue(func() { run.withholdAsNotForAssistant(verdict) })
+		case stale:
+			run.checkAddressee()
+		}
+	}()
+}
+
+// withholdAsNotForAssistant acts on the addressee check judging the words
+// were not meant for the assistant: the session's turn is interrupted and
+// its events dropped, the recording is told to stop, and once every word is
+// in they wait for the person to send them anyway. Run on the worker.
+func (run *utteranceRun) withholdAsNotForAssistant(verdict AddresseeVerdict) {
+	d := run.dispatcher
+	run.mutex.Lock()
+	if run.canceled || run.notForAssistant || run.held || run.hub.isClosed() {
+		run.mutex.Unlock()
+		return
+	}
+	run.notForAssistant = true
+	run.notForAssistantReason, run.notForAssistantModel = verdict.Reason, verdict.Model
+	session := run.conversation
+	interrupt := false
+	if session != nil {
+		session.withheld = true
+		session.heldEvents = nil
+		interrupt = !session.turnFinished && !session.stopped
+	}
+	stream := run.stream
+	finishSeen := run.finishSeen
+	run.mutex.Unlock()
+	log.Printf("[dispatch] %s: the addressee check (%s) judged the words were not meant for the assistant: %s", run.utteranceID, verdict.Model, verdict.Reason)
+
+	if interrupt {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := d.bridge.InterruptSession(ctx, session.sessionID); err != nil {
+			log.Printf("[dispatch] %s: interrupt %s, whose words were not meant for the assistant: %v", run.utteranceID, session.sessionID, err)
+		}
+		cancel()
+	}
+	if stream != nil && !finishSeen {
+		// The recording, or its last transcriptions, still run: stop the
+		// microphone, and Finish holds the words once every one is in.
+		stream.requestStop(StopReasonNotForAssistant)
+		return
+	}
+	run.holdForConfirmation(ConfirmationReasonNotForAssistant)
+}
+
+// sendWithheldWords sends, into the utterance's one session, the words the
+// addressee check withheld and the person chose to send anyway. Run on the
+// worker.
+func (run *utteranceRun) sendWithheldWords() {
+	run.mutex.Lock()
+	if run.targetDelivered || run.canceled {
+		run.mutex.Unlock()
+		return
+	}
+	run.targetDelivered = true
+	text := strings.Join(run.spokenTexts, " ")
+	indexes := run.spokenIndexes()
+	session := run.conversation
+	audio := run.audio
+	run.mutex.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if session == nil {
+		// The first segment's session could not be started; start it now.
+		created, err := run.dispatch(ctx, indexes, text)
+		if err != nil {
+			return
+		}
+		run.mutex.Lock()
+		run.conversation = created
+		run.mutex.Unlock()
+		run.decide(created.sessionID, RoleKept, "the person sent the words anyway")
+		return
+	}
+	// The session was interrupted, or its reply dropped: the words go again,
+	// whole, as its next message.
+	if run.sendIntoConversation(ctx, session, indexes, text) && audio != nil {
+		go run.shareAudio(session, audio)
+	}
 }
 
 // effortFor is the effort a session with this text starts at.
@@ -683,7 +1066,8 @@ func effortFor(text string, settings DispatchSettings) string {
 
 // dispatch sends text to a session — a pooled one when one is ready and the
 // text runs at the default effort, else a new one — and starts reading its
-// events. The session's role is speculative until a decision says otherwise.
+// events. The session's role is speculative until a decision says otherwise,
+// which for the utterance's one session is at once.
 func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, text string) (*runSession, error) {
 	d := run.dispatcher
 	settings := d.settings()
@@ -732,8 +1116,6 @@ func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, tex
 		log.Printf("[dispatch] ERROR %s: record session %s: %v", run.utteranceID, sessionID, err)
 	}
 
-	streamContext, cancelStream := context.WithTimeout(context.Background(), sessionTurnLimit)
-	session.cancelStream = cancelStream
 	run.mutex.Lock()
 	canceled := run.canceled
 	run.sessions[sessionID] = session
@@ -743,15 +1125,7 @@ func (run *utteranceRun) dispatch(ctx context.Context, segmentIndexes []int, tex
 		run.stopSession(session, "the utterance was canceled before its text was sent")
 		return nil, errors.New("canceled")
 	}
-
-	connected, streamEnded := make(chan struct{}), make(chan struct{})
-	go run.streamSession(streamContext, session, connected, streamEnded)
-	select {
-	case <-connected:
-	case <-streamEnded:
-	case <-time.After(streamOpenWait):
-		log.Printf("[dispatch] %s: the event stream of %s did not open in %s; sending anyway", run.utteranceID, sessionID, streamOpenWait)
-	}
+	run.readSession(session)
 
 	if err := d.bridge.SendMessage(ctx, sessionID, text); err != nil {
 		message := fmt.Sprintf("segments %v: send to %s: %v", segmentIndexes, sessionID, err)
@@ -796,7 +1170,7 @@ func (run *utteranceRun) deliverToTarget() {
 		return
 	}
 	run.targetDelivered = true
-	text := strings.Join(run.targetTexts, " ")
+	text := strings.Join(run.spokenTexts, " ")
 	indexes := run.spokenIndexes()
 	target := run.target
 	run.mutex.Unlock()
@@ -826,21 +1200,11 @@ func (run *utteranceRun) deliverToTarget() {
 	if err := d.store.InsertUtteranceSession(record); err != nil {
 		log.Printf("[dispatch] ERROR %s: record session %s: %v", run.utteranceID, sessionID, err)
 	}
-	streamContext, cancelStream := context.WithTimeout(context.Background(), sessionTurnLimit)
-	session.cancelStream = cancelStream
 	run.mutex.Lock()
 	run.sessions[sessionID] = session
 	run.order = append(run.order, sessionID)
 	run.mutex.Unlock()
-
-	connected, streamEnded := make(chan struct{}), make(chan struct{})
-	go run.streamSession(streamContext, session, connected, streamEnded)
-	select {
-	case <-connected:
-	case <-streamEnded:
-	case <-time.After(streamOpenWait):
-		log.Printf("[dispatch] %s: the event stream of %s did not open in %s; sending anyway", run.utteranceID, sessionID, streamOpenWait)
-	}
+	run.readSession(session)
 
 	var reason string
 	var err error
@@ -928,67 +1292,111 @@ func (run *utteranceRun) sessionChoice(text string, settings DispatchSettings) s
 	return choice
 }
 
-// streamSession reads one session's events until its result: it records the
-// first block and the result, and passes every event on unless the session
-// was superseded.
+// streamSession reads one session's events for as long as the utterance
+// lives: it records each turn's first block and result, and passes every
+// event on unless the session was superseded, stopped or withheld. While
+// the person is still speaking the events are kept back instead
+// (replyHeldBack). It ends when the utterance is done, the session's
+// stream ends or sessionTurnLimit passes.
 func (run *utteranceRun) streamSession(ctx context.Context, session *runSession, connected, streamEnded chan struct{}) {
 	d := run.dispatcher
 	defer close(streamEnded)
 	var connectOnce sync.Once
-	sawResult := false
 	err := d.bridge.StreamSessionEvents(ctx, session.sessionID, func() { connectOnce.Do(func() { close(connected) }) }, func(event BridgeEvent) bool {
+		eventType := msg.EventType(event.Type)
+		messageID, messageText := eventMessageIDAndText(event.Data)
 		run.mutex.Lock()
+		if eventType == msg.EventResult {
+			session.resultsSeen++
+		}
+		// An interrupted turn's events: all of them while it ends, and any
+		// that carry its message ids afterwards.
+		ofInterruptedTurn := session.discarding ||
+			((eventType == msg.EventBlock || eventType == msg.EventResult) && messageID != "" && session.interruptedMessageIDs[messageID])
 		awaiting := session.awaitingOwnMessage
-		if awaiting && msg.EventType(event.Type) == msg.EventUserMessage {
+		if !ofInterruptedTurn && awaiting && eventType == msg.EventUserMessage &&
+			(session.awaitedText == "" || strings.TrimSpace(messageText) == session.awaitedText) {
 			session.awaitingOwnMessage = false
 		}
+		if !ofInterruptedTurn && !awaiting && eventType == msg.EventBlock && messageID != "" {
+			if session.turnMessageIDs == nil {
+				session.turnMessageIDs = map[string]bool{}
+			}
+			session.turnMessageIDs[messageID] = true
+		}
+		followUpSequence := session.followUpSequence
 		run.mutex.Unlock()
-		if awaiting {
-			// The session's earlier turn, sent again to a new subscriber, or
-			// the message itself: neither is the reply.
+		if ofInterruptedTurn || awaiting {
+			// An interrupted turn still ending, the session's earlier turn
+			// sent again to a new subscriber, or the message itself: none
+			// is the reply.
 			return true
 		}
 		at := d.now().UnixMilli()
-		switch msg.EventType(event.Type) {
+		switch eventType {
 		case msg.EventBlock:
-			if err := d.store.SetSessionFirstBlock(session.sessionID, at); err != nil {
+			var err error
+			if followUpSequence == 0 {
+				err = d.store.SetSessionFirstBlock(session.sessionID, at)
+			} else {
+				err = d.store.SetFollowUpFirstBlock(followUpSequence, at)
+			}
+			if err != nil {
 				log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
 			}
 		case msg.EventResult:
-			if err := d.store.SetSessionResult(session.sessionID, at); err != nil {
-				log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
-			}
 			text, cost := resultReply(event.Data)
-			if err := d.store.SetSessionReply(session.sessionID, text, cost); err != nil {
+			var err error
+			if followUpSequence == 0 {
+				if err = d.store.SetSessionResult(session.sessionID, at); err == nil {
+					err = d.store.SetSessionReply(session.sessionID, text, cost)
+				}
+			} else {
+				err = d.store.SetFollowUpResult(followUpSequence, at, text, cost)
+			}
+			if err != nil {
 				log.Printf("[dispatch] ERROR %s: %v", run.utteranceID, err)
 			}
 		}
 		run.mutex.Lock()
-		forward := session.role != RoleSuperseded && !session.stopped
+		if session.role != RoleSuperseded && !session.stopped && !session.withheld {
+			if run.replyHeldBack() {
+				session.heldEvents = append(session.heldEvents, event.Data)
+			} else {
+				session.replyForwarded = true
+				// Published under run.mutex, as releaseHeldReplies does, so
+				// a held event never goes out after a later one.
+				run.hub.publish(eventSessionEvent, map[string]any{"session_id": session.sessionID, "event": event.Data})
+			}
+		}
+		if eventType == msg.EventResult {
+			session.turnFinished = true
+		}
 		run.mutex.Unlock()
-		if forward {
-			run.hub.publish(eventSessionEvent, map[string]any{"session_id": session.sessionID, "event": event.Data})
+		if eventType == msg.EventResult {
+			// The session may get another message, so the stream stays
+			// open; done closes it.
+			run.checkDone()
+			return true
 		}
-		if msg.EventType(event.Type) == msg.EventResult {
-			sawResult = true
-			return false
-		}
-		if msg.EventType(event.Type) == msg.EventSessionStatus && turnEndingStatus(event.Data) {
+		if eventType == msg.EventSessionStatus && turnEndingStatus(event.Data) {
 			return false
 		}
 		return true
 	})
 	run.mutex.Lock()
 	stopped := session.stopped
+	unfinished := !session.turnFinished
 	session.turnFinished = true
+	session.reading = false
 	replay := run.overrides != nil
 	run.mutex.Unlock()
 	if replay && !stopped {
 		// A replay's sessions are measurements: each is stopped and archived
-		// once its turn is over.
+		// once the utterance is over.
 		defer run.stopSession(session, "the replay's turn finished")
 	}
-	if !sawResult && !stopped {
+	if unfinished && !stopped {
 		problem := "its event stream ended before a result"
 		if err != nil {
 			problem += ": " + err.Error()
@@ -999,6 +1407,24 @@ func (run *utteranceRun) streamSession(ctx context.Context, session *runSession,
 		}
 	}
 	run.checkDone()
+}
+
+// eventMessageIDAndText reads, from a llm-bridge-server event, the id of the
+// message it belongs to and, for a user_message, the text sent.
+func eventMessageIDAndText(data json.RawMessage) (messageID, text string) {
+	var event struct {
+		MessageID string `json:"message_id"`
+		Result    *struct {
+			Text string `json:"text"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(data, &event); err != nil {
+		return "", ""
+	}
+	if event.Result != nil {
+		text = event.Result.Text
+	}
+	return event.MessageID, text
 }
 
 // resultReply reads the reply text and the turn's cost from a result event
@@ -1100,9 +1526,21 @@ func (run *utteranceRun) stopSession(session *runSession, reason string) {
 }
 
 // scheduleWindowExpiry makes the decisions final when no segment follows
-// this one within the continuation window.
+// this one within the continuation window, for segments the phone cuts
+// itself.
 func (run *utteranceRun) scheduleWindowExpiry(segment Segment) {
 	d := run.dispatcher
+	run.mutex.Lock()
+	streamed := run.stream != nil
+	run.mutex.Unlock()
+	if streamed {
+		// A streamed recording ends by its own clock, in audio time: the
+		// stream tells the phone to stop when the window closes, and the
+		// phone's stop finishes the utterance. Finalizing here as well,
+		// while the microphone was still open, sent done first on
+		// 2026-11-17 and the stop never reached the phone.
+		return
+	}
 	window := d.settings().ContinuationWindow
 	wait := time.UnixMilli(segment.SpeechEndedAtMs).Add(window).Sub(d.now())
 	if wait < 0 {
@@ -1191,11 +1629,15 @@ func (run *utteranceRun) cancel() {
 }
 
 // checkDone sends done once the utterance is canceled, or its decisions are
-// final and every session not superseded has finished its turn.
+// final, no held words wait, and every session not superseded has finished
+// its turn. It never sends done while a streamed recording still runs: done
+// closes the event stream, and the stop_recording that ends the recording
+// would not reach the phone.
 func (run *utteranceRun) checkDone() {
 	run.mutex.Lock()
-	ready := run.canceled
-	if run.final && !ready {
+	canceled := run.canceled
+	ready := canceled
+	if run.final && !ready && !run.confirmationOpen {
 		ready = true
 		for _, session := range run.sessions {
 			if session.role != RoleSuperseded && !session.turnFinished {
@@ -1204,12 +1646,29 @@ func (run *utteranceRun) checkDone() {
 			}
 		}
 	}
+	stream := run.stream
 	run.mutex.Unlock()
 	if !ready || run.hub.isClosed() {
 		return
 	}
+	if !canceled && stream != nil && !stream.isStopped() {
+		return
+	}
+	// Nothing more will be said: whatever reply was kept back goes out.
+	run.releaseHeldReplies(true)
 	run.hub.publish(eventDone, map[string]any{})
 	run.stopOnce.Do(func() { close(run.stopped) })
+	run.mutex.Lock()
+	var cancelStreams []context.CancelFunc
+	for _, session := range run.sessions {
+		if session.cancelStream != nil {
+			cancelStreams = append(cancelStreams, session.cancelStream)
+		}
+	}
+	run.mutex.Unlock()
+	for _, cancelStream := range cancelStreams {
+		cancelStream()
+	}
 }
 
 // done is closed once the utterance has sent done.
@@ -1279,7 +1738,7 @@ func (d *Dispatcher) ReceiveAudio(utterance Utterance, filename, contentType str
 	var targets []*runSession
 	for _, sessionID := range run.order {
 		session := run.sessions[sessionID]
-		if session.role != RoleSuperseded && !session.stopped && session.ownedByVoiceIntake {
+		if session.role != RoleSuperseded && !session.stopped && !session.withheld && session.ownedByVoiceIntake {
 			targets = append(targets, session)
 		}
 	}

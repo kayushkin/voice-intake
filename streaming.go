@@ -31,11 +31,37 @@ const (
 	StopReasonMaximumDuration          = "max_duration"
 	StopReasonContinuationWindowClosed = "continuation_window_closed"
 	StopReasonNoSpeech                 = "no_speech"
+	// StopReasonSegmentLimit: a quick recording has sent as many segments
+	// as maximum_quick_segments allows.
+	StopReasonSegmentLimit = "segment_limit"
+	// StopReasonNotForAssistant: the addressee check judged the words were
+	// not meant for the assistant.
+	StopReasonNotForAssistant = "not_for_assistant"
+	// StopReasonStopRecordingUnanswered is this service's own: the phone
+	// did not stop within stopRecordingGrace of being told to, so the
+	// service stopped taking its audio.
+	StopReasonStopRecordingUnanswered = "stop_recording_unanswered"
+	// StopReasonAudioStoppedArriving is this service's own too: the phone
+	// sent no audio for streamIdleLimit and never posted stop.
+	StopReasonAudioStoppedArriving = "audio_stopped_arriving"
 )
+
+// stopRecordingGrace is how long the phone has to post stop after
+// stop_recording before this service stops listening by itself. A phone
+// that never got the event must not leave the microphone's audio arriving
+// here until its own longest recording ends.
+var stopRecordingGrace = 10 * time.Second
+
+// streamIdleLimit is how long a live stream may go without a chunk of audio
+// before this service ends it. The phone sends a chunk every 200 ms or so;
+// one that lost its network or its process sends nothing more, and nothing
+// else would finish its utterance, since a streamed recording ends only by
+// its stop.
+var streamIdleLimit = 20 * time.Second
 
 // stopReasons are every reason POST …/stop takes.
 var stopReasons = map[string]bool{StopReasonUser: true, StopReasonReplyPlaying: true, StopReasonMaximumDuration: true,
-	StopReasonContinuationWindowClosed: true, StopReasonNoSpeech: true}
+	StopReasonContinuationWindowClosed: true, StopReasonNoSpeech: true, StopReasonSegmentLimit: true, StopReasonNotForAssistant: true}
 
 // Errors of AppendStreamAudio.
 var (
@@ -60,6 +86,10 @@ type StreamOptions struct {
 	MaximumRecording   time.Duration
 	ContinuationWindow time.Duration
 	TranscriberName    string
+	// MaximumSegments tells a recording that ends segments at pauses to
+	// stop once it has cut this many that were not too weak to count; zero
+	// is no limit.
+	MaximumSegments int
 	// HighPassCutoffHertz filters the audio the detector and the transcriber
 	// hear; zero leaves it as recorded.
 	HighPassCutoffHertz int
@@ -83,6 +113,9 @@ func StreamOptionsFor(utterance Utterance, settings StreamSettings) StreamOption
 	default:
 		options.Silence = settings.EndpointSilence
 	}
+	if options.Silence > 0 {
+		options.MaximumSegments = settings.MaximumQuickSegments
+	}
 	return options
 }
 
@@ -102,16 +135,22 @@ type audioStream struct {
 	heardPCM []byte
 	highPass *highPassFilter
 	// probabilities holds every window's speech probability, by window.
-	probabilities       []float64
-	endpointer          *endpointer
-	windowSamples       int
-	nextSegmentIndex    int
-	heardSegment        bool
+	probabilities    []float64
+	endpointer       *endpointer
+	windowSamples    int
+	nextSegmentIndex int
+	// heardSegments counts the segments cut that were not too weak to
+	// count as speech, and lastSpeechEndSample is where the last of them
+	// ended: the no-speech timeout, the continuation window and the limit
+	// of segments all leave weakly heard noise out.
+	heardSegments       int
 	lastSpeechEndSample int
 	stopRecordingSent   bool
 	stopRecording       chan struct{}
 	stopped             bool
 	pending             sync.WaitGroup
+	// idleTimer ends the stream when no audio arrives for streamIdleLimit.
+	idleTimer *time.Timer
 }
 
 // streamingAvailable reports why a streaming utterance cannot be taken, if
@@ -141,8 +180,16 @@ func (d *Dispatcher) StartStream(utterance Utterance, options StreamOptions) err
 	run.mutex.Lock()
 	defer run.mutex.Unlock()
 	if run.stream == nil {
-		run.stream = &audioStream{run: run, utterance: utterance, options: options, transcriber: transcriber, detector: d.detector,
+		stream := &audioStream{run: run, utterance: utterance, options: options, transcriber: transcriber, detector: d.detector,
 			stopRecording: make(chan struct{}), highPass: newHighPassFilter(options.HighPassCutoffHertz)}
+		if !options.Replay {
+			// A replay feeds its own audio and always stops itself.
+			stream.idleTimer = time.AfterFunc(streamIdleLimit, func() {
+				stream.stopFromThisSide(StopReasonAudioStoppedArriving,
+					fmt.Sprintf("no audio arrived for %s and the phone posted no stop, so this service ended the recording", streamIdleLimit))
+			})
+		}
+		run.stream = stream
 	}
 	return nil
 }
@@ -190,6 +237,9 @@ func (stream *audioStream) append(ctx context.Context, offset int64, chunk []byt
 		return total, nil
 	}
 	fresh := chunk[overlap:]
+	if stream.idleTimer != nil {
+		stream.idleTimer.Reset(streamIdleLimit)
+	}
 	stream.pcm = append(stream.pcm, fresh...)
 	heard := fresh
 	if stream.highPass != nil {
@@ -218,6 +268,7 @@ func (stream *audioStream) append(ctx context.Context, offset int64, chunk []byt
 		stream.act(event)
 	}
 	stream.checkStopConditions()
+	stream.run.speechHeard(stream.endpointer.speechInProgress())
 	return total, nil
 }
 
@@ -234,8 +285,9 @@ func (stream *audioStream) act(event endpointerEvent) {
 
 // checkStopConditions tells the phone to stop, once, when the recording has
 // gone on too long, held no speech, or passed the continuation window after
-// the last segment. Every measure is audio time, so a replay decides as the
-// live stream did.
+// the last segment. A segment too weakly heard to transcribe counts as no
+// speech for all three. Every measure is audio time, so a replay decides as
+// the live stream did.
 func (stream *audioStream) checkStopConditions() {
 	if stream.stopRecordingSent {
 		return
@@ -246,14 +298,19 @@ func (stream *audioStream) checkStopConditions() {
 	switch {
 	case audioMs >= stream.options.MaximumRecording.Milliseconds():
 		stream.sendStopRecording(StopReasonMaximumDuration)
-	case !stream.heardSegment && !speaking && audioMs >= stream.options.NoSpeechTimeout.Milliseconds():
+	case stream.heardSegments == 0 && !speaking && audioMs >= stream.options.NoSpeechTimeout.Milliseconds():
 		stream.sendStopRecording(StopReasonNoSpeech)
-	case stream.options.Silence > 0 && stream.heardSegment && !speaking && audioMs-lastSpeechEndMs >= stream.options.ContinuationWindow.Milliseconds():
+	case stream.options.Silence > 0 && stream.heardSegments > 0 && !speaking && audioMs-lastSpeechEndMs >= stream.options.ContinuationWindow.Milliseconds():
 		stream.sendStopRecording(StopReasonContinuationWindowClosed)
 	}
 }
 
+// sendStopRecording tells the phone to stop, once. The caller holds
+// stream.mutex.
 func (stream *audioStream) sendStopRecording(reason string) {
+	if stream.stopRecordingSent || stream.stopped {
+		return
+	}
 	stream.stopRecordingSent = true
 	close(stream.stopRecording)
 	d := stream.run.dispatcher
@@ -261,6 +318,44 @@ func (stream *audioStream) sendStopRecording(reason string) {
 		log.Printf("[stream] ERROR %s: %v", stream.utterance.UtteranceID, err)
 	}
 	stream.run.hub.publish(eventStopRecording, map[string]any{"reason": reason})
+	if stream.options.Replay {
+		// A replay stops feeding audio by itself.
+		return
+	}
+	time.AfterFunc(stopRecordingGrace, func() {
+		stream.stopFromThisSide(StopReasonStopRecordingUnanswered,
+			fmt.Sprintf("the phone did not stop recording within %s of stop_recording (%s), so this service stopped taking its audio", stopRecordingGrace, reason))
+	})
+}
+
+// stopFromThisSide ends a stream the phone left open: its audio is refused
+// from here on, and the utterance finishes with what was heard. problem
+// says why, for the utterance's errors and the phone.
+func (stream *audioStream) stopFromThisSide(stopReason, problem string) {
+	if stream.isStopped() {
+		return
+	}
+	d := stream.run.dispatcher
+	stream.run.recordError(problem)
+	nowMs := d.now().UnixMilli()
+	if err := d.StopStream(stream.utterance, nowMs-stream.utterance.ClientClockSkewMs, nowMs, stopReason); err != nil {
+		stream.run.recordError(fmt.Sprintf("stop the stream the phone left open: %v", err))
+	}
+}
+
+// requestStop tells the phone to stop for a reason the dispatcher has: the
+// addressee check, say. It does nothing when the phone was already told or
+// has stopped.
+func (stream *audioStream) requestStop(reason string) {
+	stream.mutex.Lock()
+	defer stream.mutex.Unlock()
+	stream.sendStopRecording(reason)
+}
+
+func (stream *audioStream) isStopped() bool {
+	stream.mutex.Lock()
+	defer stream.mutex.Unlock()
+	return stream.stopped
 }
 
 // endSegment cuts the speech [startSample, endSample) with padding and has
@@ -270,8 +365,7 @@ func (stream *audioStream) endSegment(startSample, endSample int) {
 	endpointedAtMs := d.now().UnixMilli()
 	index := stream.nextSegmentIndex
 	stream.nextSegmentIndex++
-	stream.heardSegment = true
-	stream.lastSpeechEndSample = endSample
+	stream.run.segmentCut(index)
 	paddingSamples := int(segmentPadding.Milliseconds()) * segmentAudioSampleRate / 1000
 	fromByte := max(0, (startSample-paddingSamples)*2)
 	toByte := min(len(stream.heardPCM), (endSample+paddingSamples)*2)
@@ -279,6 +373,16 @@ func (stream *audioStream) endSegment(startSample, endSample int) {
 	startOffsetMs := int64(startSample) * 1000 / segmentAudioSampleRate
 	endOffsetMs := int64(endSample) * 1000 / segmentAudioSampleRate
 	strength := stream.speechStrength(startSample, endSample)
+	if weakSpeechReason(strength, stream.options.MinimumSegmentMeanSpeechProbability) == "" {
+		stream.heardSegments++
+		stream.lastSpeechEndSample = endSample
+		if stream.options.MaximumSegments > 0 && stream.heardSegments >= stream.options.MaximumSegments {
+			// The limit of one quick recording: this segment is sent, and
+			// the recording ends. An accidental start beside a conversation
+			// would otherwise send a piece at every pause for minutes.
+			stream.sendStopRecording(StopReasonSegmentLimit)
+		}
+	}
 	stream.pending.Add(1)
 	go func() {
 		defer stream.pending.Done()
@@ -393,11 +497,15 @@ func (d *Dispatcher) StopStream(utterance Utterance, stoppedAtClientMs, stoppedA
 		return nil
 	}
 	stream.stopped = true
+	if stream.idleTimer != nil {
+		stream.idleTimer.Stop()
+	}
 	if stream.endpointer != nil {
 		stream.act(stream.endpointer.finish(len(stream.pcm) / 2))
 	}
 	pcm := stream.pcm
 	stream.mutex.Unlock()
+	stream.run.speechHeard(false)
 	if err := d.store.MarkUtteranceStopped(utterance.UtteranceID, stoppedAtClientMs, stoppedAtMs, reason); err != nil {
 		return err
 	}
@@ -425,10 +533,14 @@ func (stream *audioStream) cancel() {
 	stream.mutex.Lock()
 	already := stream.stopped
 	stream.stopped = true
+	if stream.idleTimer != nil {
+		stream.idleTimer.Stop()
+	}
 	stream.mutex.Unlock()
 	if already {
 		return
 	}
+	stream.run.speechHeard(false)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := stream.detector.Close(ctx, stream.utterance.UtteranceID); err != nil {

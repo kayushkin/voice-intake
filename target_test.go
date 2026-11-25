@@ -98,8 +98,8 @@ func TestASessionTargetGetsOneMessageAfterFinishAndOnlyItsNewReply(t *testing.T)
 	if got := h.bridge.personSent["br_mine"]; len(got) != 1 || got[0] != "what's the weather like in São Paulo" {
 		t.Fatalf("sent to the person's session = %v, want one joined message", got)
 	}
-	if len(h.judge.asked) != 0 {
-		t.Fatalf("the judge was asked %v", h.judge.asked)
+	if asked := h.judge.askedTexts(); len(asked) != 0 {
+		t.Fatalf("the addressee check was asked %v about words sent to the person's own session", asked)
 	}
 	if replies := resultTexts(events); len(replies) != 1 || replies[0] != "answer to what's the weather like in São Paulo" {
 		t.Fatalf("replies passed on = %v, want only the new one", replies)

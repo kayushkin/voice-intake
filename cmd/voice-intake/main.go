@@ -37,11 +37,11 @@ func main() {
 	bridgeURL := registry.String(voiceintake.SettingLLMBridgeURL)
 	serviceToken := registry.String(voiceintake.SettingLLMBridgeServiceToken)
 	bridge := voiceintake.NewHTTPSessionBridge(bridgeURL, serviceToken)
-	judge := voiceintake.NewBridgeContinuationJudge(bridgeURL, serviceToken)
+	addresseeJudge := voiceintake.NewBridgeAddresseeJudge(bridgeURL, serviceToken)
 	settings := func() voiceintake.DispatchSettings { return voiceintake.DispatchSettingsFrom(registry) }
 	principals := voiceintake.NewPrincipalStoreVerifier(registry.String(voiceintake.SettingPrincipalStoreURL), time.Now)
 	pool := voiceintake.NewSessionPool(store, bridge, settings, principals, time.Now)
-	dispatcher := voiceintake.NewDispatcher(store, bridge, judge, pool, settings, time.Now, filepath.Join(dataDirectory, "audio"))
+	dispatcher := voiceintake.NewDispatcher(store, bridge, addresseeJudge, pool, settings, time.Now, filepath.Join(dataDirectory, "audio"))
 	transcribers := voiceintake.Transcribers{}
 	for name, inferenceURL := range registry.StringMap(voiceintake.SettingTranscribers) {
 		transcribers[name] = voiceintake.NewWhisperServerTranscriber(inferenceURL)
@@ -59,7 +59,7 @@ func main() {
 	server.SetAppReleasePublishToken(registry.String(voiceintake.SettingAppReleasePublishToken))
 
 	modelStoreURL := strings.TrimRight(registry.String(voiceintake.SettingModelStoreURL), "/")
-	server.SetSettingValidator(voiceintake.SettingContinuationJudgeModelRole, func(ctx context.Context, role string) error {
+	server.SetSettingValidator(voiceintake.SettingAddresseeCheckModelRole, func(ctx context.Context, role string) error {
 		var answer struct {
 			Roles []string `json:"roles"`
 		}

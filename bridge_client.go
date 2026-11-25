@@ -40,6 +40,9 @@ type SessionBridge interface {
 	CreateSession(ctx context.Context, creation SessionCreation) (string, error)
 	SendMessage(ctx context.Context, sessionID, text string) error
 	StopSession(ctx context.Context, sessionID string) error
+	// InterruptSession stops the turn a session is running and leaves the
+	// session alive: its next message starts a new turn.
+	InterruptSession(ctx context.Context, sessionID string) error
 	ArchiveSession(ctx context.Context, sessionID string) error
 	RenameSession(ctx context.Context, sessionID, displayName string) error
 	SessionState(ctx context.Context, sessionID string) (string, error)
@@ -287,6 +290,12 @@ func (b *HTTPSessionBridge) SendMessage(ctx context.Context, sessionID, text str
 // StopSession ends a session.
 func (b *HTTPSessionBridge) StopSession(ctx context.Context, sessionID string) error {
 	return b.do(ctx, http.MethodPost, "/sessions/"+url.PathEscape(sessionID)+"/stop", "", map[string]any{}, nil)
+}
+
+// InterruptSession stops a session's running turn. The bridge answers 409
+// when the session has no process to interrupt.
+func (b *HTTPSessionBridge) InterruptSession(ctx context.Context, sessionID string) error {
+	return b.do(ctx, http.MethodPost, "/sessions/"+url.PathEscape(sessionID)+"/interrupt", "", map[string]any{}, nil)
 }
 
 // ArchiveSession moves a session to the chat's Archive.

@@ -26,6 +26,11 @@ const (
 	// Held words: the person confirms them, or they are never sent.
 	eventAwaitingConfirmation = "awaiting_confirmation"
 	eventConfirmationEnded    = "confirmation_ended"
+	// One press, one session: a later segment sent into the session, and
+	// words the addressee check withheld, which wait for the person to send
+	// them anyway.
+	eventFollowUp        = "follow_up"
+	eventNotForAssistant = "not_for_assistant"
 )
 
 // eventHub keeps every event of one utterance, so a subscriber that connects

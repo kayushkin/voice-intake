@@ -45,7 +45,8 @@ const (
 	SettingDefaultEffort                       = "default_effort"
 	SettingDefaultModel                        = "default_model"
 	SettingEffortRaisingPhrases                = "effort_raising_phrases"
-	SettingContinuationJudgeModelRole          = "continuation_judge_model_role"
+	SettingAddresseeCheckModelRole             = "addressee_check_model_role"
+	SettingMaximumQuickSegments                = "maximum_quick_segments"
 	SettingInstanceID                          = "instance_id"
 	SettingEndpointSilenceMilliseconds         = "endpoint_silence_ms"
 	SettingEagerSilenceMilliseconds            = "eager_silence_ms"
@@ -82,11 +83,11 @@ func SettingDefinitions() []servicesettings.Definition {
 		{Key: SettingDataDirectory, EnvironmentVariable: "VOICE_INTAKE_DATA_DIR", Kind: path, ValueType: text, Default: DefaultDataDir(),
 			Description: "The directory that holds voice-intake.db and the audio the phone uploads."},
 		{Key: SettingLLMBridgeURL, EnvironmentVariable: "VOICE_INTAKE_LLM_BRIDGE_URL", Kind: wiring, ValueType: text, Default: "http://127.0.0.1:8160",
-			Description: "Where llm-bridge-server answers: sessions are created, sent to, stopped and streamed there, and the continuation judge is asked through its POST /oneshot."},
+			Description: "Where llm-bridge-server answers: sessions are created, sent to, stopped and streamed there, and the addressee check is asked through its POST /oneshot."},
 		{Key: SettingLLMBridgeServiceToken, EnvironmentVariable: "LLMBRIDGE_SERVICE_TOKEN", Kind: secret, ValueType: text, Required: true,
 			Description: "llm-bridge-server's service token, sent as X-LLM-Bridge-Service-Token, with X-Principal-Id naming the person when a session is created for them."},
 		{Key: SettingModelStoreURL, EnvironmentVariable: "VOICE_INTAKE_MODEL_STORE_URL", Kind: wiring, ValueType: text, Default: "http://127.0.0.1:8155",
-			Description: "Where model-store answers: a new continuation_judge_model_role is checked against its roles and a new default_model against its models."},
+			Description: "Where model-store answers: a new addressee_check_model_role is checked against its roles and a new default_model against its models."},
 		{Key: SettingPrincipalStoreURL, EnvironmentVariable: "VOICE_INTAKE_PRINCIPAL_STORE_URL", Kind: wiring, ValueType: text, Default: "http://127.0.0.1:8314",
 			Description: "Where principal-store answers: every X-Principal-Id, and every person whose pool is filled at start, must be an enabled principal there."},
 		{Key: SettingSessionWorkingDirectory, EnvironmentVariable: "VOICE_INTAKE_SESSION_WORKING_DIR", Kind: path, ValueType: text,
@@ -103,15 +104,17 @@ func SettingDefinitions() []servicesettings.Definition {
 		{Key: SettingPoolSize, EnvironmentVariable: "VOICE_INTAKE_POOL_SIZE", Kind: behavior, ValueType: integer, Default: "1", Editable: true,
 			Description: "How many started sessions to keep ready per person, so the first segment of an utterance goes to a running session."},
 		{Key: SettingContinuationWindowMilliseconds, EnvironmentVariable: "VOICE_INTAKE_CONTINUATION_WINDOW_MS", Kind: behavior, ValueType: integer, Default: "8000", Editable: true,
-			Description: "A segment received within this many milliseconds of the previous segment's speech end may continue it, and the judge is asked. Later than that, it is a separate request, and the earlier decisions are final."},
+			Description: "How long a quick recording waits for more speech after a segment's speech end. A streamed recording is told to stop (stop_recording, reason continuation_window_closed) when it passes; for segments the phone cuts itself, the utterance becomes final."},
 		{Key: SettingDefaultEffort, EnvironmentVariable: "VOICE_INTAKE_DEFAULT_EFFORT", Kind: behavior, ValueType: text, Default: "low", Editable: true,
 			Description: "The effort a voice session runs at unless its text raises it."},
 		{Key: SettingDefaultModel, EnvironmentVariable: "VOICE_INTAKE_DEFAULT_MODEL", Kind: behavior, ValueType: text, Editable: true,
 			Description: "The model a voice session runs on, by model-store id. Empty leaves the harness default."},
 		{Key: SettingEffortRaisingPhrases, EnvironmentVariable: "VOICE_INTAKE_EFFORT_RAISING_PHRASES", Kind: behavior, ValueType: list, Default: "think hard,think carefully,take your time", Editable: true,
 			Description: "Phrases that, found in a session's text without regard to case, start it at raised_effort instead of default_effort."},
-		{Key: SettingContinuationJudgeModelRole, EnvironmentVariable: "VOICE_INTAKE_CONTINUATION_JUDGE_MODEL_ROLE", Kind: behavior, ValueType: role, Default: "efficient", Editable: true,
-			Description: "The model-store role asked whether a new segment continues the earlier request."},
+		{Key: SettingAddresseeCheckModelRole, EnvironmentVariable: "VOICE_INTAKE_ADDRESSEE_CHECK_MODEL_ROLE", Kind: behavior, ValueType: role, Default: "efficient", Editable: true,
+			Description: "The model-store role asked, beside the session, whether the words heard so far were meant for the assistant. When it says no, the session is interrupted, the recording is told to stop and the words wait for the person to send them anyway."},
+		{Key: SettingMaximumQuickSegments, EnvironmentVariable: "VOICE_INTAKE_MAXIMUM_QUICK_SEGMENTS", Kind: behavior, ValueType: integer, Default: "5", Editable: true,
+			Description: "How many segments of speech one quick recording may send. A streamed recording is told to stop (stop_recording, reason segment_limit) when the last of them ends; segments the phone cuts itself are not sent past it. Zero: no limit."},
 		{Key: SettingInstanceID, EnvironmentVariable: "VOICE_INTAKE_INSTANCE_ID", Kind: behavior, ValueType: text, Editable: true,
 			Description: "The llm-bridge-server instance voice sessions start on; its harness type is read from the bridge."},
 		{Key: SettingEndpointSilenceMilliseconds, EnvironmentVariable: "VOICE_INTAKE_ENDPOINT_SILENCE_MS", Kind: behavior, ValueType: integer, Default: "900", Editable: true,
@@ -144,7 +147,7 @@ func NewSettingsRegistry(environment servicesettings.Environment) (*servicesetti
 // contract's order.
 var voiceSettingKeys = []string{
 	SettingPoolSize, SettingContinuationWindowMilliseconds, SettingDefaultEffort, SettingDefaultModel,
-	SettingEffortRaisingPhrases, SettingContinuationJudgeModelRole, SettingInstanceID,
+	SettingEffortRaisingPhrases, SettingAddresseeCheckModelRole, SettingMaximumQuickSegments, SettingInstanceID,
 	SettingEndpointSilenceMilliseconds, SettingEagerSilenceMilliseconds,
 	SettingTranscriber, SettingNoSpeechTimeoutMilliseconds, SettingMaximumRecordingMilliseconds,
 	SettingRaisedInstanceID, SettingRaisedModel,
@@ -246,7 +249,11 @@ type DispatchSettings struct {
 	RaisedEffort         string
 	DefaultModel         string
 	EffortRaisingPhrases []string
-	JudgeModelRole       string
+	// AddresseeCheckModelRole is the model-store role the addressee check asks.
+	AddresseeCheckModelRole string
+	// MaximumQuickSegments is how many segments one quick recording may
+	// send; zero is no limit.
+	MaximumQuickSegments int
 	InstanceID           string
 	WorkingDirectory     string
 	RaisedInstanceID     string
@@ -262,6 +269,9 @@ type StreamSettings struct {
 	MaximumRecording   time.Duration
 	ContinuationWindow time.Duration
 	Transcriber        string
+	// MaximumQuickSegments is how many segments a quick recording may hold
+	// before it is told to stop; zero is no limit.
+	MaximumQuickSegments int
 	// HighPassCutoffHertz filters the audio before the detector and the
 	// transcriber; zero leaves it as it is.
 	HighPassCutoffHertz int
@@ -280,6 +290,7 @@ func StreamSettingsFrom(registry *servicesettings.Registry) StreamSettings {
 		MaximumRecording:                    milliseconds(SettingMaximumRecordingMilliseconds),
 		ContinuationWindow:                  milliseconds(SettingContinuationWindowMilliseconds),
 		Transcriber:                         registry.String(SettingTranscriber),
+		MaximumQuickSegments:                registry.Integer(SettingMaximumQuickSegments),
 		HighPassCutoffHertz:                 registry.Integer(SettingHighPassCutoffHertz),
 		MinimumSegmentMeanSpeechProbability: registry.Decimal(SettingMinimumSegmentMeanSpeechProbability),
 	}
@@ -288,17 +299,18 @@ func StreamSettingsFrom(registry *servicesettings.Registry) StreamSettings {
 // DispatchSettingsFrom reads DispatchSettings from the registry.
 func DispatchSettingsFrom(registry *servicesettings.Registry) DispatchSettings {
 	return DispatchSettings{
-		PoolSize:             registry.Integer(SettingPoolSize),
-		ContinuationWindow:   time.Duration(registry.Integer(SettingContinuationWindowMilliseconds)) * time.Millisecond,
-		DefaultEffort:        registry.String(SettingDefaultEffort),
-		RaisedEffort:         registry.String(SettingRaisedEffort),
-		DefaultModel:         registry.String(SettingDefaultModel),
-		EffortRaisingPhrases: registry.StringList(SettingEffortRaisingPhrases),
-		JudgeModelRole:       registry.ModelRole(SettingContinuationJudgeModelRole),
-		InstanceID:           registry.String(SettingInstanceID),
-		WorkingDirectory:     registry.String(SettingSessionWorkingDirectory),
-		RaisedInstanceID:     registry.String(SettingRaisedInstanceID),
-		RaisedModel:          registry.String(SettingRaisedModel),
+		PoolSize:                registry.Integer(SettingPoolSize),
+		ContinuationWindow:      time.Duration(registry.Integer(SettingContinuationWindowMilliseconds)) * time.Millisecond,
+		DefaultEffort:           registry.String(SettingDefaultEffort),
+		RaisedEffort:            registry.String(SettingRaisedEffort),
+		DefaultModel:            registry.String(SettingDefaultModel),
+		EffortRaisingPhrases:    registry.StringList(SettingEffortRaisingPhrases),
+		AddresseeCheckModelRole: registry.ModelRole(SettingAddresseeCheckModelRole),
+		MaximumQuickSegments:    registry.Integer(SettingMaximumQuickSegments),
+		InstanceID:              registry.String(SettingInstanceID),
+		WorkingDirectory:        registry.String(SettingSessionWorkingDirectory),
+		RaisedInstanceID:        registry.String(SettingRaisedInstanceID),
+		RaisedModel:             registry.String(SettingRaisedModel),
 	}
 }
 
