@@ -1138,3 +1138,31 @@ func (b *fakeBridge) sharedInto(sessionID string) []string {
 	defer b.mutex.Unlock()
 	return append([]string(nil), b.shared[sessionID]...)
 }
+
+func TestAPooledSessionTheReaperStoppedIsReplacedWhenARecordingStarts(t *testing.T) {
+	h := newHarness(t, map[string]string{"VOICE_INTAKE_POOL_SIZE": "1"})
+	h.pool.Fill(testPrincipal)
+	h.pool.WaitForFills()
+	_, ids, _, _ := h.bridge.snapshot()
+	stoppedByReaper := ids[0]
+	h.bridge.mutex.Lock()
+	h.bridge.states[stoppedByReaper] = "completed"
+	h.bridge.mutex.Unlock()
+
+	// The recording starts; no segment has ended yet.
+	utteranceID := h.createUtterance("recording-starts-after-a-quiet-spell")
+	h.pool.WaitForFills()
+	_, ids, _, stopped := h.bridge.snapshot()
+	if !contains(stopped, stoppedByReaper) || len(ids) != 2 {
+		t.Fatalf("sessions %v, stopped %v; want %s given up and its replacement started before the first segment", ids, stopped, stoppedByReaper)
+	}
+	now := time.Now().UnixMilli()
+	h.postSegment(utteranceID, 0, "add milk to my grocery list", now)
+	h.call("POST", "/api/voice/utterances/"+utteranceID+"/finish", map[string]any{"ended_at_ms": now}, testPrincipal)
+	h.followUntilDone(utteranceID)
+	h.pool.WaitForFills()
+	_, _, sent, _ := h.bridge.snapshot()
+	if got := sent[ids[1]]; len(got) != 1 || got[0] != "add milk to my grocery list" {
+		t.Fatalf("the replacement %s was sent %v; want the first segment", ids[1], got)
+	}
+}

@@ -350,12 +350,14 @@ func decisionEventData(sessionID, role, reason string) map[string]any {
 	return map[string]any{"session_id": sessionID, "role": role, "reason": reason}
 }
 
-// Start makes the run for a new utterance and fills the person's pool.
+// Start makes the run for a new utterance and readies the person's pool:
+// a waiting session the bridge has stopped is replaced now, while the
+// person is still speaking.
 func (d *Dispatcher) Start(utterance Utterance) error {
 	if _, err := d.runFor(utterance); err != nil {
 		return err
 	}
-	d.pool.Fill(utterance.PrincipalID)
+	d.pool.Refresh(utterance.PrincipalID)
 	return nil
 }
 
@@ -425,12 +427,14 @@ func (run *utteranceRun) holdForConfirmation(reason string) {
 	run.mutex.Unlock()
 	if strings.TrimSpace(text) == "" {
 		run.recordError(fmt.Sprintf("no words were heard, so nothing was held for confirmation or sent to the %s", target.Kind))
+		run.endConfirmation()
 		run.finalize("no words were heard")
 		return
 	}
 	expiresAtMs := d.now().Add(confirmationLimit).UnixMilli()
 	if err := d.store.HoldForConfirmation(run.utteranceID, text, expiresAtMs, reason); err != nil {
 		run.recordError(fmt.Sprintf("hold the words for confirmation: %v; nothing was sent", err))
+		run.endConfirmation()
 		run.stopWithheldConversation("the words could not be held for confirmation")
 		run.finalize("the words could not be held for confirmation")
 		return
@@ -741,12 +745,14 @@ func (run *utteranceRun) processSegment(segment Segment) {
 func (run *utteranceRun) sendIntoConversation(ctx context.Context, session *runSession, segmentIndexes []int, text string) bool {
 	d := run.dispatcher
 	run.mutex.Lock()
-	if session.stopped || run.canceled {
+	if session.stopped || run.canceled || session.withheld {
 		stopped := session.stopped
 		run.mutex.Unlock()
 		if stopped {
 			run.recordError(fmt.Sprintf("segments %v were not sent: session %s has been stopped", segmentIndexes, session.sessionID))
 		}
+		// Withheld: the addressee check's verdict came as this segment was
+		// on its way; its words are kept with the rest.
 		return false
 	}
 	interruptedReply := !session.turnFinished
@@ -773,7 +779,6 @@ func (run *utteranceRun) sendIntoConversation(ctx context.Context, session *runS
 	session.heldEvents = nil
 	session.turnMessageIDs = nil
 	session.replyForwarded = false
-	session.withheld = false
 	run.mutex.Unlock()
 
 	if interruptedReply {
@@ -819,6 +824,17 @@ func (run *utteranceRun) sendIntoConversation(ctx context.Context, session *runS
 	}
 	run.hub.publish(eventFollowUp, map[string]any{"session_id": session.sessionID, "segment_indexes": segmentIndexes, "text": text,
 		"interrupted_reply": interruptedReply})
+	run.mutex.Lock()
+	withheldMeanwhile := session.withheld
+	run.mutex.Unlock()
+	if withheldMeanwhile {
+		// The verdict's own interrupt may have reached the bridge before
+		// this message did, and then the message started a turn nobody
+		// stopped.
+		if err := d.bridge.InterruptSession(ctx, session.sessionID); err != nil {
+			log.Printf("[dispatch] %s: interrupt %s, whose words were withheld as a segment was sent: %v", run.utteranceID, session.sessionID, err)
+		}
+	}
 	return true
 }
 
@@ -969,7 +985,10 @@ func (run *utteranceRun) checkAddressee() {
 				run.checkAddressee()
 			}
 		case !verdict.ForAssistant:
-			run.enqueue(func() { run.withholdAsNotForAssistant(verdict) })
+			// Acted on here and now, not in the worker's queue: the worker
+			// may be busy sending the next segments, which is what the
+			// verdict is there to stop.
+			run.withholdAsNotForAssistant(verdict)
 		case stale:
 			run.checkAddressee()
 		}
@@ -978,8 +997,10 @@ func (run *utteranceRun) checkAddressee() {
 
 // withholdAsNotForAssistant acts on the addressee check judging the words
 // were not meant for the assistant: the session's turn is interrupted and
-// its events dropped, the recording is told to stop, and once every word is
-// in they wait for the person to send them anyway. Run on the worker.
+// its events dropped, no later segment is sent, the recording is told to
+// stop, and once every word is in they wait for the person to send them
+// anyway. It runs off the worker, the moment the verdict comes; only the
+// hold itself is the worker's.
 func (run *utteranceRun) withholdAsNotForAssistant(verdict AddresseeVerdict) {
 	d := run.dispatcher
 	run.mutex.Lock()
@@ -989,6 +1010,9 @@ func (run *utteranceRun) withholdAsNotForAssistant(verdict AddresseeVerdict) {
 	}
 	run.notForAssistant = true
 	run.notForAssistantReason, run.notForAssistantModel = verdict.Reason, verdict.Model
+	// The words are about to be held: done must not go out in between, as
+	// it would when the interrupted turn ends.
+	run.confirmationOpen = true
 	session := run.conversation
 	interrupt := false
 	if session != nil {
@@ -1014,7 +1038,7 @@ func (run *utteranceRun) withholdAsNotForAssistant(verdict AddresseeVerdict) {
 		stream.requestStop(StopReasonNotForAssistant)
 		return
 	}
-	run.holdForConfirmation(ConfirmationReasonNotForAssistant)
+	run.enqueue(func() { run.holdForConfirmation(ConfirmationReasonNotForAssistant) })
 }
 
 // sendWithheldWords sends, into the utterance's one session, the words the
@@ -1048,6 +1072,9 @@ func (run *utteranceRun) sendWithheldWords() {
 	}
 	// The session was interrupted, or its reply dropped: the words go again,
 	// whole, as its next message.
+	run.mutex.Lock()
+	session.withheld = false
+	run.mutex.Unlock()
 	if run.sendIntoConversation(ctx, session, indexes, text) && audio != nil {
 		go run.shareAudio(session, audio)
 	}

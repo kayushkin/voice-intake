@@ -117,7 +117,7 @@ checked. Each check is a row of the utterance's `addressee_checks`: `text`,
 `started_at_ms`, `duration_ms`, `error`.
 
 - **For the assistant:** nothing changes.
-- **Not for the assistant:** the session's turn is interrupted and its events are no longer passed on; a streamed recording gets `stop_recording` with reason `not_for_assistant`; and once every word is in, the words are held and `event: not_for_assistant` `{"text","reason","model","expires_at_ms"}` is sent, `text` being every word heard and `reason` the model's few words. They then wait as held words do (*Confirmation*), with `confirmation_reason` `not_for_assistant` on the utterance: `POST …/confirm` sends them again, whole, into the same session; `POST …/cancel` discards them and stops and archives the session; after two minutes they expire, and the session is stopped, archived and marked `superseded`. **A client must never send these by a countdown**: that is why they are not sent as `awaiting_confirmation`.
+- **Not for the assistant:** at once, without waiting for segments still being sent, the session's turn is interrupted, its events are no longer passed on and no later segment is sent to it; a streamed recording gets `stop_recording` with reason `not_for_assistant`; and once every word is in, the words are held and `event: not_for_assistant` `{"text","reason","model","expires_at_ms"}` is sent, `text` being every word heard and `reason` the model's few words. They then wait as held words do (*Confirmation*), with `confirmation_reason` `not_for_assistant` on the utterance: `POST …/confirm` sends them again, whole, into the same session; `POST …/cancel` discards them and stops and archives the session; after two minutes they expire, and the session is stopped, archived and marked `superseded`. **A client must never send these by a countdown**: that is why they are not sent as `awaiting_confirmation`.
 - **The check fails:** an `error` event says it did not run and that the words were sent unchecked. Nothing is held.
 
 The check takes a few seconds on this kind of model call, about as long as
@@ -165,7 +165,13 @@ starts filling at their first utterance, and at start for everyone who has
 made one. A waiting session the bridge reports `aborted`, `error`,
 `disconnected` or `completed` is given up. One the bridge's idle reaper
 stopped reads `completed`, and the bridge cannot resume it, since it never
-had a turn and its harness saved no conversation. Each session row
+had a turn and its harness saved no conversation. The reaper stops a
+session nobody has spoken to for 15 minutes, so after any quiet spell the
+waiting session is dead: **when a recording starts** the pool asks the
+bridge for each waiting session's state, gives up the dead ones and starts
+their replacements, so a new session is warming while the person is still
+speaking. (Until 2026-11-25 the dead one was found only when the first
+segment came for it, and that segment's session started from nothing.) Each session row
 records whether it was pooled and the state the pooled session was in, so
 pooled and fresh sessions can be compared. Changing a setting the pool
 depends on gives up the waiting sessions that no longer match.

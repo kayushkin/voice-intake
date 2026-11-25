@@ -118,6 +118,43 @@ func (pool *SessionPool) Take(ctx context.Context, principalID, utteranceID stri
 	}
 }
 
+// Refresh gives up the person's waiting sessions the bridge has since
+// stopped, and fills the pool, in the background. The bridge's idle reaper
+// stops a session nobody has spoken to for 15 minutes, so after any quiet
+// spell the pool holds a dead one; Fill alone counts it as waiting. Called
+// when a recording starts, this starts the replacement while the person is
+// still speaking, instead of leaving the first segment to find the dead one
+// and start a session from nothing.
+func (pool *SessionPool) Refresh(principalID string) {
+	pool.mutex.Lock()
+	pool.known[principalID] = true
+	candidates := pool.waiting[principalID]
+	pool.waiting[principalID] = nil
+	pool.mutex.Unlock()
+	pool.filling.Add(1)
+	go func() {
+		defer pool.filling.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for _, candidate := range candidates {
+			state, err := pool.bridge.SessionState(ctx, candidate.SessionID)
+			switch {
+			case err != nil:
+				// Left for Take, which reads the state again and gives the
+				// session up if it still cannot.
+				log.Printf("[pool] ERROR could not read the state of pooled session %s: %v", candidate.SessionID, err)
+			case sessionStatesThatCannotTakeAMessage[state]:
+				pool.release(ctx, candidate, "it was "+state+" when a recording started")
+				continue
+			}
+			pool.mutex.Lock()
+			pool.waiting[principalID] = append(pool.waiting[principalID], candidate)
+			pool.mutex.Unlock()
+		}
+		pool.Fill(principalID)
+	}()
+}
+
 // Fill starts sessions in the background until the person's pool is at size.
 func (pool *SessionPool) Fill(principalID string) {
 	settings := pool.settings()
